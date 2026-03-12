@@ -1,0 +1,110 @@
+{
+  "version": 1,
+  "name": "worker-default",
+  "description": "Default policy for worker agents. Safety rules, escalation on failure, skill preferences.",
+  "rules": [
+    {
+      "id": "safety-no-rm-rf",
+      "description": "Block rm -rf on root or home paths",
+      "priority": 1000,
+      "precondition": { "type": "action_match", "field": "params.command", "pattern": "rm\\s+(-[a-z]*f[a-z]*\\s+)?/" },
+      "effect": "block",
+      "message": "Blocked: dangerous rm command on root path"
+    },
+    {
+      "id": "safety-no-sudo",
+      "description": "Block sudo commands",
+      "priority": 1000,
+      "precondition": { "type": "action_match", "field": "params.command", "pattern": "^sudo\\s" },
+      "effect": "block",
+      "message": "Blocked: sudo not permitted for worker agents"
+    },
+    {
+      "id": "safety-no-env-secrets",
+      "description": "Block commands that dump environment variables (may contain secrets)",
+      "priority": 999,
+      "precondition": { "type": "action_match", "field": "params.command", "pattern": "^(env|printenv|set)$" },
+      "effect": "block",
+      "message": "Blocked: environment dump may expose secrets"
+    },
+    {
+      "id": "escalate-consecutive-failures",
+      "description": "Escalate to executive after 3 consecutive failures",
+      "priority": 900,
+      "precondition": { "type": "consecutive_failures", "count": 3 },
+      "effect": "escalate",
+      "message": "3 consecutive failures — requesting executive guidance"
+    },
+    {
+      "id": "escalate-low-confidence",
+      "description": "Escalate when top candidate value is very low",
+      "priority": 850,
+      "precondition": { "type": "value_below", "threshold": 0.15 },
+      "effect": "escalate",
+      "message": "No high-confidence actions available — requesting guidance"
+    },
+    {
+      "id": "auto-complete-criteria",
+      "description": "Auto-complete when all success criteria are met",
+      "priority": 800,
+      "precondition": { "type": "all_criteria_met" },
+      "effect": "override",
+      "action": {
+        "kind": "primitive",
+        "type": "complete",
+        "description": "All success criteria satisfied",
+        "params": { "summary": "All success criteria met — task complete" }
+      }
+    },
+    {
+      "id": "rate-limit-rapid-bash",
+      "description": "Prevent runaway bash loops (>5 in 3 seconds)",
+      "priority": 300,
+      "precondition": { "type": "rapid_actions", "actionType": "bash", "withinMs": 3000, "count": 5 },
+      "effect": "override",
+      "action": {
+        "kind": "primitive",
+        "type": "wait",
+        "description": "Rate limiting: too many rapid bash commands",
+        "params": {}
+      }
+    },
+    {
+      "id": "boost-research-skill",
+      "description": "Boost arxiv-research when task involves papers or algorithms",
+      "priority": 50,
+      "precondition": { "type": "task_match", "pattern": "paper|arxiv|algorithm|research|implement.*from" },
+      "effect": "boost",
+      "skillName": "arxiv-research",
+      "boostValue": 0.3
+    },
+    {
+      "id": "boost-code-search",
+      "description": "Boost code-search when task involves finding functions",
+      "priority": 50,
+      "precondition": { "type": "task_match", "pattern": "find.*function|search.*code|locate.*method|where.*implemented" },
+      "effect": "boost",
+      "skillName": "code-search",
+      "boostValue": 0.3
+    },
+    {
+      "id": "log-all-skills",
+      "description": "Log whenever a skill action is selected",
+      "priority": 10,
+      "precondition": { "type": "action_match", "field": "kind", "pattern": "^skill$" },
+      "effect": "log",
+      "message": "Skill action selected"
+    }
+  ],
+  "impasse": {
+    "noProgressHeartbeats": 5,
+    "repeatedActionThreshold": 3,
+    "escalateTarget": "parent",
+    "escalateMessage": "Worker is stuck and requesting executive guidance"
+  },
+  "defaults": {
+    "maxCandidates": 5,
+    "minActionValue": 0.1,
+    "explorationRate": 0.0
+  }
+}

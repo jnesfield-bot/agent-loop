@@ -31,7 +31,7 @@
  *   --segments           Print segment names and their tags, then exit
  */
 
-import { readFileSync, existsSync } from "fs";
+import { readFileSync, existsSync, openSync, readSync, closeSync } from "fs";
 
 // ── Parse args ──────────────────────────────────────────
 
@@ -116,11 +116,11 @@ if (stateFile) {
 } else {
   // Read from stdin
   let input = "";
-  const fd = require("fs").openSync("/dev/stdin", "r");
+  const fd = openSync("/dev/stdin", "r");
   const buf = Buffer.alloc(65536);
   let n;
-  while ((n = require("fs").readSync(fd, buf)) > 0) input += buf.slice(0, n).toString();
-  require("fs").closeSync(fd);
+  while ((n = readSync(fd, buf)) > 0) input += buf.slice(0, n).toString();
+  closeSync(fd);
   state = JSON.parse(input);
 }
 

@@ -47,7 +47,11 @@ npm install
 ANTHROPIC_API_KEY=sk-ant-... npx tsx src/main.ts [work-directory]
 ```
 
-### Docker
+### Docker (interactive pi session)
+
+Opens a full interactive pi TUI with the agent-loop extension loaded — the same
+experience as running `pi` locally, but with `/loop` commands and the heartbeat
+tool available.
 
 ```bash
 git clone https://github.com/jnesfield-bot/agent-loop.git
@@ -56,11 +60,20 @@ docker build -t agent-loop .
 docker run -it -e ANTHROPIC_API_KEY=sk-ant-... agent-loop
 ```
 
+Once inside, use `/loop <task>` to start a heartbeat-driven task, or just chat
+normally — all pi features work.
+
 Or use the provided script:
 
 ```bash
 chmod +x run.sh
 ANTHROPIC_API_KEY=sk-ant-... ./run.sh
+```
+
+For headless (non-interactive) mode:
+
+```bash
+docker run -it -e ANTHROPIC_API_KEY=sk-ant-... agent-loop npx tsx src/main.ts /workspace
 ```
 
 ## Core Concepts

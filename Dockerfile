@@ -14,6 +14,9 @@ COPY tsconfig.json ./
 COPY src/ ./src/
 COPY skills/ ./skills/
 COPY sequences/ ./sequences/
+COPY policies/ ./policies/
+COPY tests/ ./tests/
+COPY test-all.sh ./
 
 RUN mkdir -p /workspace /buffer
 

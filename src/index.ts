@@ -1,6 +1,7 @@
 // Public API
 export { AgentLoop } from "./agent-loop.js";
 export { SingleAgent } from "./single-agent.js";
+export { Blackboard } from "./blackboard.js";
 export type {
   Action,
   ActionResult,
@@ -8,6 +9,7 @@ export type {
   AgentLoopConfig,
   ChildStatus,
   Input,
+  LoopContext,
   LoopEvent,
   LoopEventListener,
   ScoredAction,

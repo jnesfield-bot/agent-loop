@@ -31,12 +31,15 @@ import {
 import { existsSync, readFileSync, readdirSync, writeFileSync, mkdirSync, copyFileSync, statSync } from "fs";
 import { writeFile, readFile, mkdir } from "fs/promises";
 import { join, basename } from "path";
+import { execSync } from "child_process";
 import { AgentLoop } from "./agent-loop.js";
+import { Blackboard } from "./blackboard.js";
 import type {
   Action,
   ActionResult,
   AgentLoopConfig,
   Input,
+  LoopContext,
   PrimitiveAction,
   ScoredAction,
   SkillAction,
@@ -86,6 +89,12 @@ export interface SingleAgentConfig extends AgentLoopConfig {
   replayBufferDir?: string;
   /** Episode ID for grouping transitions. Auto-generated if not set. */
   episodeId?: string;
+  /** Blackboard lens for this agent's view */
+  lens?: "executive" | "worker" | "monitor" | "minimal";
+  /** Path to policy JSON file */
+  policyPath?: string;
+  /** Directory for tri-store memory (episodic/semantic/procedural) */
+  memoryDir?: string;
 }
 
 // ── Implementation ───────────────────────────────────────
@@ -103,12 +112,29 @@ export class SingleAgent extends AgentLoop {
   private replayIndex: any = null;
   private episodeId: string;
 
+  // ── New: Blackboard, Policy, Memory, Impasse ──────────
+  private board: Blackboard;
+  private lastBoardText: string = "";
+  private policy: any = null;  // Loaded from policy JSON
+  private memoryDir: string;   // Tri-store memory directory
+  private loopContext: LoopContext = {
+    heartbeat: 0,
+    consecutiveFailures: 0,
+    repeatedActionCount: 0,
+    noProgressHeartbeats: 0,
+    lastActionType: null,
+    recentActions: [],
+    topCandidateValue: 0,
+  };
+
   constructor(config: SingleAgentConfig) {
     super(config);
     this.agentConfig = config;
     this.task = config.task ?? null;
     this.replayBufferDir = config.replayBufferDir ?? null;
     this.episodeId = config.episodeId ?? `ep-${Date.now().toString(36)}`;
+    this.board = new Blackboard(config.lens ?? "worker");
+    this.memoryDir = config.memoryDir ?? join(config.workDir, "tri-memory");
   }
 
   // ── Setup / Teardown ─────────────────────────────────────
@@ -122,6 +148,8 @@ export class SingleAgent extends AgentLoop {
     await this.loadMemory();
     this.skills = this.discoverSkills();
     this.initReplayBuffer();
+    this.loadPolicy();
+    this.initTriMemory();
 
     // Initialize pi SDK
     const authStorage = AuthStorage.create(join(workDir, "auth.json"));
@@ -222,8 +250,13 @@ export class SingleAgent extends AgentLoop {
   }
 
   /**
-   * Record one heartbeat transition into the replay buffer.
+   * Record one heartbeat transition.
    * Called automatically by the base loop after every act().
+   *
+   * This is the RECORD phase — it does three things:
+   *   1. Write to replay buffer (episodic backing store)
+   *   2. Write to tri-store memory (episodic index, procedural updates)
+   *   3. Update impasse tracking context
    */
   protected override async recordTransition(
     state: State,
@@ -231,6 +264,10 @@ export class SingleAgent extends AgentLoop {
     selected: Action,
     result: ActionResult,
   ): Promise<void> {
+    // Always update loop context and tri-memory (even without replay buffer)
+    this.updateLoopContext(selected, result);
+    this.writeTriMemory(selected, result);
+
     if (!this.replayBufferDir || !this.replayIndex) return;
 
     const id = this.replayIndex.stats.totalTransitions + 1;
@@ -519,14 +556,18 @@ export class SingleAgent extends AgentLoop {
   }
 
   // ── Phase 1: OBSERVE ─────────────────────────────────────
+  //
+  // The blackboard is the primary observation surface.
+  // We gather state, read all 3 memory stores, render through the lens,
+  // and produce both a State object and a board text for the LLM.
+  //
 
   protected async observe(): Promise<State> {
     await this.loadMemory();
 
+    // Gather workspace state
     const observations: Record<string, unknown> = {};
-
     try {
-      const { execSync } = await import("child_process");
       const files = execSync(`find ${this.config.workDir} -maxdepth 3 -type f | head -50`, {
         encoding: "utf-8",
         timeout: 5000,
@@ -539,7 +580,7 @@ export class SingleAgent extends AgentLoop {
     const inputs = [...this.inputs];
     this.inputs = [];
 
-    return {
+    const state: State = {
       timestamp: Date.now(),
       agentId: this.config.agentId,
       currentTask: this.task,
@@ -551,6 +592,94 @@ export class SingleAgent extends AgentLoop {
       activeSkill: this.activeSkill,
       observations,
     };
+
+    // ── Read tri-store memory ────────────────────────────
+    const extras: Parameters<Blackboard["populate"]>[1] = {};
+
+    // Episodic: recent experiences
+    const episodicIndex = this.loadTriJson("episodic", "episode-index.json");
+    if (episodicIndex && episodicIndex.length > 0) {
+      const recent = episodicIndex.slice(-5);
+      extras.episodicSummary = recent.map((e: any) => {
+        const icon = e.success ? "✓" : "✗";
+        return `${icon} hb${e.heartbeat} ${e.actionType ?? "?"} ${e.taskSnippet?.substring(0, 40) ?? ""}`;
+      });
+    }
+
+    // Semantic: relevant entities (query by current task)
+    const entities = this.loadTriJson("semantic", "entities.json");
+    if (entities && Object.keys(entities).length > 0) {
+      const taskText = (state.currentTask?.description ?? "").toLowerCase();
+      const taskTokens = taskText.split(/\W+/).filter((t: string) => t.length > 2);
+
+      // Score entities by relevance to current task
+      const scored = Object.entries(entities).map(([id, e]: [string, any]) => {
+        const searchText = [id, e.type ?? "", ...(e.facts ?? [])].join(" ").toLowerCase();
+        let score = 0;
+        for (const t of taskTokens) { if (searchText.includes(t)) score++; }
+        return { id, e, score };
+      }).filter(x => x.score > 0).sort((a, b) => b.score - a.score);
+
+      const top = scored.slice(0, 5);
+      if (top.length > 0) {
+        extras.semanticEntities = top.map(x =>
+          `${x.id} [${x.e.type ?? "?"}]: ${(x.e.facts ?? []).slice(0, 2).join("; ")}`
+        );
+      }
+    }
+
+    // Procedural: matching rules and procedures
+    const rules = this.loadTriJson("procedural", "rules.json");
+    if (rules && Object.keys(rules).length > 0) {
+      const highConf = Object.entries(rules)
+        .map(([id, r]: [string, any]) => ({ id, ...r }))
+        .filter((r: any) => r.confidence >= 0.5)
+        .sort((a: any, b: any) => b.confidence - a.confidence)
+        .slice(0, 5);
+
+      if (highConf.length > 0) {
+        extras.proceduralRules = highConf.map((r: any) =>
+          `[${(r.confidence ?? 0).toFixed(2)}] ${r.description ?? r.id}`
+        );
+      }
+    }
+
+    // Policy: show active safety/lifecycle rules
+    if (this.policy?.rules) {
+      const activeRules = this.policy.rules
+        .filter((r: any) => (r.priority ?? 0) >= 500)
+        .slice(0, 4);
+      if (activeRules.length > 0) {
+        extras.policyRules = activeRules.map((r: any) =>
+          `[${r.priority}] ${r.effect}: ${r.description ?? r.id}`
+        );
+      }
+    }
+
+    // Impasse warning
+    if (this.loopContext.consecutiveFailures >= 2) {
+      extras.impasseWarning = `${this.loopContext.consecutiveFailures} consecutive failures`;
+    } else if (this.loopContext.noProgressHeartbeats >= 3) {
+      extras.impasseWarning = `No progress for ${this.loopContext.noProgressHeartbeats} heartbeats`;
+    }
+
+    // Scratchpad from working memory
+    const scratch = this.memory["_scratchpad"];
+    if (scratch) {
+      extras.scratchpad = scratch.split("\n").slice(0, 5);
+    }
+
+    // ── Populate and render the blackboard ───────────────
+    (state as any).heartbeat = this.heartbeatCount;
+    this.board.populate(state, extras);
+    this.lastBoardText = this.board.render();
+
+    // Store board text in observations so evaluate() can use it
+    observations["board"] = this.lastBoardText;
+
+    this.emit({ type: "observe_complete", state, board: this.lastBoardText, timestamp: Date.now() });
+
+    return state;
   }
 
   // ── Phase 2: EVALUATE ────────────────────────────────────
@@ -577,14 +706,215 @@ export class SingleAgent extends AgentLoop {
   }
 
   // ── Phase 3: SELECT ──────────────────────────────────────
+  //
+  // The policy engine runs BEFORE greedy selection.
+  // Rules can block, boost, filter, override, or escalate.
+  // This is Soar's propose-evaluate-select cycle.
+  //
 
   protected select(scoredActions: ScoredAction[]): Action {
     if (scoredActions.length === 0) {
       return { kind: "primitive", type: "wait", description: "No actions available", params: {} };
     }
 
+    // Update loop context for policy evaluation
+    this.loopContext.heartbeat = this.heartbeatCount;
+    this.loopContext.topCandidateValue = Math.max(...scoredActions.map(c => c.value));
+
+    // ── Check impasse conditions first ───────────────────
+    const impasse = this.checkImpasse();
+    if (impasse) {
+      this.emit({ type: "impasse_detected", impasseType: impasse.type, message: impasse.message, timestamp: Date.now() });
+
+      // If we have a policy impasse handler, use it
+      if (this.policy?.impasse) {
+        return {
+          kind: "primitive",
+          type: "message",
+          description: this.policy.impasse.escalateMessage ?? impasse.message,
+          params: {
+            to: this.policy.impasse.escalateTarget ?? "parent",
+            content: impasse.message,
+            channel: "escalation",
+          },
+        };
+      }
+    }
+
+    // ── Apply policy rules to candidates ─────────────────
+    if (this.policy?.rules) {
+      const result = this.applyPolicyRules(scoredActions);
+
+      this.emit({
+        type: "select_complete",
+        selected: result.action,
+        policyLog: result.log,
+        timestamp: Date.now(),
+      });
+
+      return result.action;
+    }
+
+    // ── Fallback: greedy select (no policy loaded) ───────
     const sorted = [...scoredActions].sort((a, b) => b.value - a.value);
     return sorted[0].action;
+  }
+
+  /**
+   * Apply production rules from the policy file to scored candidates.
+   * Rules are sorted by priority (highest first). Effects:
+   *   block    → reject candidate, try next
+   *   override → replace with rule's action
+   *   boost    → adjust value, re-sort
+   *   filter   → remove matching candidates
+   *   escalate → send message to parent
+   *   log      → audit only
+   */
+  private applyPolicyRules(candidates: ScoredAction[]): { action: Action; log: any[] } {
+    let pool = [...candidates].sort((a, b) => b.value - a.value);
+    const log: any[] = [];
+    const rules = [...this.policy.rules].sort((a: any, b: any) => (b.priority ?? 0) - (a.priority ?? 0));
+    const state = this.lastState;
+
+    // First pass: boost and filter across all candidates
+    for (const rule of rules) {
+      if (rule.effect === "boost" && this.matchPrecondition(rule, state, null)) {
+        for (const c of pool) {
+          const isMatch = rule.skillName
+            ? (c.action.kind === "skill" && (c.action as SkillAction).skillName === rule.skillName)
+            : (rule.actionType && (c.action as PrimitiveAction).type === rule.actionType);
+          if (isMatch) {
+            c.value += rule.boostValue ?? 0.1;
+            log.push({ rule: rule.id, effect: "boost", target: c.action.description?.substring(0, 30) });
+          }
+        }
+      }
+      if (rule.effect === "filter" && this.matchPrecondition(rule, state, null)) {
+        const before = pool.length;
+        pool = pool.filter(c => {
+          if (rule.actionType && (c.action as PrimitiveAction).type === rule.actionType) return false;
+          return true;
+        });
+        if (pool.length < before) log.push({ rule: rule.id, effect: "filter", removed: before - pool.length });
+      }
+    }
+
+    pool.sort((a, b) => b.value - a.value);
+
+    // Second pass: check each candidate top-down for block/override/escalate
+    for (const candidate of pool) {
+      let blocked = false;
+
+      for (const rule of rules) {
+        if (!this.matchPrecondition(rule, state, candidate.action)) continue;
+
+        if (rule.effect === "block") {
+          log.push({ rule: rule.id, effect: "block", blocked: candidate.action.description?.substring(0, 30), message: rule.message });
+          blocked = true;
+          break;
+        }
+        if (rule.effect === "override" && rule.action) {
+          log.push({ rule: rule.id, effect: "override" });
+          return { action: rule.action, log };
+        }
+        if (rule.effect === "escalate") {
+          log.push({ rule: rule.id, effect: "escalate", message: rule.message });
+          return {
+            action: {
+              kind: "primitive", type: "message",
+              description: rule.message ?? "Policy escalation",
+              params: { to: "parent", content: rule.message, channel: "escalation" },
+            },
+            log,
+          };
+        }
+        if (rule.effect === "log") {
+          log.push({ rule: rule.id, effect: "log", message: rule.message });
+        }
+      }
+
+      if (!blocked) return { action: candidate.action, log };
+    }
+
+    // All candidates blocked
+    log.push({ effect: "all_blocked" });
+    return {
+      action: { kind: "primitive", type: "wait", description: "All actions blocked by policy", params: {} },
+      log,
+    };
+  }
+
+  /**
+   * Check a single policy rule's precondition against current state and action.
+   */
+  private matchPrecondition(rule: any, state: State | null, action: Action | null): boolean {
+    const pre = rule.precondition;
+    if (!pre) return false;
+
+    switch (pre.type) {
+      case "always": return true;
+
+      case "action_match": {
+        if (!action) return false;
+        const val = String(this.getNestedField(action, pre.field) ?? "");
+        return new RegExp(pre.pattern, "i").test(val);
+      }
+
+      case "task_match": {
+        const desc = state?.currentTask?.description ?? "";
+        return new RegExp(pre.pattern, "i").test(desc);
+      }
+
+      case "consecutive_failures":
+        return this.loopContext.consecutiveFailures >= (pre.count ?? 3);
+
+      case "value_below":
+        return this.loopContext.topCandidateValue < (pre.threshold ?? 0.2);
+
+      case "rapid_actions": {
+        const now = Date.now();
+        const windowMs = pre.withinMs ?? 5000;
+        const recent = this.loopContext.recentActions.filter(a =>
+          a.type === pre.actionType && (now - a.timestamp) < windowMs
+        );
+        return recent.length >= (pre.count ?? 5);
+      }
+
+      case "all_criteria_met": {
+        const criteria = state?.currentTask?.successCriteria ?? [];
+        return criteria.length > 0 && criteria.every(c => {
+          const key = `criteria_${c.replace(/\W+/g, "_").toLowerCase()}`;
+          return state?.memory[key] === "done" || state?.memory[key] === "true";
+        });
+      }
+
+      default: return false;
+    }
+  }
+
+  private getNestedField(obj: any, fieldPath: string): any {
+    return fieldPath.split(".").reduce((o, k) => o?.[k], obj);
+  }
+
+  /**
+   * Detect impasse conditions: stuck agent, repeated failures, no progress.
+   */
+  private checkImpasse(): { type: string; message: string } | null {
+    const ctx = this.loopContext;
+
+    if (ctx.consecutiveFailures >= 3) {
+      return { type: "consecutive_failures", message: `${ctx.consecutiveFailures} consecutive failures` };
+    }
+
+    if (ctx.repeatedActionCount >= 3) {
+      return { type: "repeated_action", message: `Same action repeated ${ctx.repeatedActionCount} times` };
+    }
+
+    if (ctx.noProgressHeartbeats >= (this.policy?.impasse?.noProgressHeartbeats ?? 5)) {
+      return { type: "no_progress", message: `No progress for ${ctx.noProgressHeartbeats} heartbeats` };
+    }
+
+    return null;
   }
 
   // ── Phase 4: ACT ─────────────────────────────────────────
@@ -1077,6 +1407,139 @@ Respond with ONLY "continue" or "abort".`;
     return `Message sent to ${to} on channel ${channel}: "${content.substring(0, 100)}"`;
   }
 
+  // ── Policy Loading ──────────────────────────────────────
+
+  private loadPolicy(): void {
+    // Try configured path, then default locations
+    const paths = [
+      this.agentConfig.policyPath,
+      join(this.config.workDir, "policy.json"),
+      join(this.config.workDir, "..", "policies", "worker-default.json"),
+    ].filter(Boolean) as string[];
+
+    for (const p of paths) {
+      if (existsSync(p)) {
+        try {
+          this.policy = JSON.parse(readFileSync(p, "utf-8"));
+          return;
+        } catch { /* skip invalid */ }
+      }
+    }
+    // No policy found — that's fine, select() falls back to greedy
+    this.policy = null;
+  }
+
+  // ── Tri-Store Memory ──────────────────────────────────
+
+  private initTriMemory(): void {
+    for (const store of ["episodic", "semantic", "procedural"]) {
+      mkdirSync(join(this.memoryDir, store), { recursive: true });
+    }
+  }
+
+  private loadTriJson(store: string, filename: string): any {
+    const path = join(this.memoryDir, store, filename);
+    if (!existsSync(path)) return null;
+    try { return JSON.parse(readFileSync(path, "utf-8")); }
+    catch { return null; }
+  }
+
+  private saveTriJson(store: string, filename: string, data: any): void {
+    mkdirSync(join(this.memoryDir, store), { recursive: true });
+    writeFileSync(join(this.memoryDir, store, filename), JSON.stringify(data, null, 2));
+  }
+
+  /**
+   * Write to tri-store memory after each heartbeat.
+   * - Episodic: index entry for this transition
+   * - Semantic: extract entities from action/result (lightweight)
+   * - Procedural: update rule confidence based on success/failure
+   */
+  private writeTriMemory(action: Action, result: ActionResult): void {
+    // Episodic: append to index
+    const index = this.loadTriJson("episodic", "episode-index.json") ?? [];
+    const actionType = action.kind === "skill"
+      ? `skill:${(action as SkillAction).skillName}`
+      : (action as PrimitiveAction).type;
+
+    index.push({
+      heartbeat: this.heartbeatCount,
+      episodeId: this.episodeId,
+      actionType,
+      success: result.success,
+      timestamp: new Date().toISOString(),
+      taskSnippet: (this.task?.description ?? "").substring(0, 100),
+    });
+
+    // Keep bounded
+    if (index.length > 1000) index.splice(0, index.length - 1000);
+    this.saveTriJson("episodic", "episode-index.json", index);
+
+    // Procedural: update relevant rules
+    const rules = this.loadTriJson("procedural", "rules.json") ?? {};
+    const ruleId = `action-${actionType}`;
+    const existing = rules[ruleId];
+    if (existing) {
+      const successes = (existing.successes ?? 0) + (result.success ? 1 : 0);
+      const failures = (existing.failures ?? 0) + (result.success ? 0 : 1);
+      const total = successes + failures;
+      rules[ruleId] = {
+        ...existing,
+        confidence: (successes + 1) / (total + 2), // Laplace smoothing
+        successes, failures,
+        usageCount: (existing.usageCount ?? 0) + 1,
+        updatedAt: new Date().toISOString(),
+      };
+      this.saveTriJson("procedural", "rules.json", rules);
+    }
+
+    this.emit({ type: "memory_write", store: "episodic", key: `hb${this.heartbeatCount}`, timestamp: Date.now() });
+  }
+
+  /**
+   * Update impasse tracking context after each heartbeat.
+   */
+  private updateLoopContext(action: Action, result: ActionResult): void {
+    const actionType = action.kind === "skill"
+      ? `skill:${(action as SkillAction).skillName}`
+      : (action as PrimitiveAction).type;
+
+    // Track consecutive failures
+    if (result.success) {
+      this.loopContext.consecutiveFailures = 0;
+    } else {
+      this.loopContext.consecutiveFailures++;
+    }
+
+    // Track repeated actions
+    if (actionType === this.loopContext.lastActionType) {
+      this.loopContext.repeatedActionCount++;
+    } else {
+      this.loopContext.repeatedActionCount = 1;
+      this.loopContext.lastActionType = actionType;
+    }
+
+    // Track recent actions (sliding window)
+    this.loopContext.recentActions.push({
+      type: actionType,
+      timestamp: Date.now(),
+      success: result.success,
+    });
+    // Keep last 20
+    if (this.loopContext.recentActions.length > 20) {
+      this.loopContext.recentActions.shift();
+    }
+
+    // Track progress (simple: did the output change?)
+    const outputHash = result.output.substring(0, 200);
+    if (this.memory["_lastOutputHash"] === outputHash) {
+      this.loopContext.noProgressHeartbeats++;
+    } else {
+      this.loopContext.noProgressHeartbeats = 0;
+      this.memory["_lastOutputHash"] = outputHash;
+    }
+  }
+
   // ── Memory Persistence ───────────────────────────────────
 
   private async loadMemory(): Promise<void> {
@@ -1178,58 +1641,23 @@ Propose 1-5 candidate actions (primitive or skill). Score them honestly.`;
   private buildEvaluatePrompt(state: State): string {
     const parts: string[] = [];
 
-    parts.push(`## Current State (Heartbeat #${this.heartbeatCount})`);
-    parts.push(`Time: ${new Date(state.timestamp).toISOString()}`);
+    // The blackboard IS the primary observation — dense, structured, complete.
+    // The LLM gets the full rendered board, not a redundant breakdown.
+    parts.push(`## Observation Board`);
+    parts.push("```");
+    parts.push(this.lastBoardText);
+    parts.push("```");
 
-    if (state.currentTask) {
-      parts.push(`\n## Task`);
-      parts.push(`Description: ${state.currentTask.description}`);
-      parts.push(`Success Criteria:`);
-      for (const c of state.currentTask.successCriteria) parts.push(`  - ${c}`);
-      if (state.currentTask.constraints.length > 0) {
-        parts.push(`Constraints:`);
-        for (const c of state.currentTask.constraints) parts.push(`  - ${c}`);
-      }
-    }
-
-    // Show available skills
-    if (state.availableSkills.length > 0) {
-      parts.push(`\n## Available Skills`);
-      for (const skill of state.availableSkills) {
-        parts.push(`- **${skill.name}**: ${skill.description}`);
-      }
-      parts.push(`\nInvoke a skill when a coherent multi-step workflow is more appropriate than a single command.`);
-    }
-
-    if (Object.keys(state.memory).length > 0) {
-      parts.push(`\n## Memory`);
-      for (const [key, value] of Object.entries(state.memory)) parts.push(`${key}: ${value}`);
-    }
-
-    if (state.inputs.length > 0) {
-      parts.push(`\n## Pending Inputs`);
-      for (const input of state.inputs) parts.push(`[${input.source}] ${input.content}`);
-    }
-
-    if (state.lastActionResult) {
-      parts.push(`\n## Last Action Result`);
-      const r = state.lastActionResult;
-      parts.push(`Action: ${r.action.kind === "skill" ? `skill:${(r.action as SkillAction).skillName}` : r.action.type} — ${r.action.description}`);
-      parts.push(`Success: ${r.success}`);
-      parts.push(`Output: ${r.output.substring(0, 2000)}`);
-      if (r.error) parts.push(`Error: ${r.error}`);
-      if (r.skillTrace) {
-        parts.push(`Skill steps completed: ${r.skillTrace.currentStep + 1}/${r.skillTrace.steps.length}`);
-      }
-    }
-
-    if (state.observations["workspace_files"]) {
-      parts.push(`\n## Workspace Files`);
-      parts.push(state.observations["workspace_files"] as string);
+    // Only add detail the board doesn't include: last action full output
+    if (state.lastActionResult?.output && state.lastActionResult.output.length > 100) {
+      parts.push(`\n## Last Action Detail`);
+      parts.push(state.lastActionResult.output.substring(0, 2000));
+      if (state.lastActionResult.error) parts.push(`Error: ${state.lastActionResult.error}`);
     }
 
     parts.push(`\n## Instructions`);
     parts.push(`Propose 1-5 candidate actions (primitive or skill) as a JSON array. Score each by value.`);
+    parts.push(`The board above is your complete view. Use it to decide what to do next.`);
 
     return parts.join("\n");
   }

@@ -192,18 +192,33 @@ export interface AgentLoopConfig {
   skillDirs?: string[];
 }
 
+// ── Impasse Tracking ─────────────────────────────────────
+
+/** Context for policy evaluation and impasse detection */
+export interface LoopContext {
+  heartbeat: number;
+  consecutiveFailures: number;
+  repeatedActionCount: number;
+  noProgressHeartbeats: number;
+  lastActionType: string | null;
+  recentActions: Array<{ type: string; timestamp: number; success: boolean }>;
+  topCandidateValue: number;
+}
+
 // ── Events ───────────────────────────────────────────────
 
 /** Events emitted by the agent loop for observability */
 export type LoopEvent =
   | { type: "heartbeat_start"; heartbeat: number; timestamp: number }
-  | { type: "observe_complete"; state: State; timestamp: number }
+  | { type: "observe_complete"; state: State; board: string; timestamp: number }
   | { type: "evaluate_complete"; scoredActions: ScoredAction[]; timestamp: number }
-  | { type: "select_complete"; selected: Action; timestamp: number }
+  | { type: "select_complete"; selected: Action; policyLog?: unknown[]; timestamp: number }
   | { type: "act_complete"; result: ActionResult; timestamp: number }
   | { type: "skill_step_start"; skill: string; step: number; description: string; timestamp: number }
   | { type: "skill_step_end"; skill: string; step: number; success: boolean; timestamp: number }
   | { type: "skill_complete"; skill: string; success: boolean; steps: number; timestamp: number }
+  | { type: "memory_write"; store: string; key: string; timestamp: number }
+  | { type: "impasse_detected"; impasseType: string; message: string; timestamp: number }
   | { type: "heartbeat_end"; heartbeat: number; timestamp: number }
   | { type: "loop_paused"; reason: string; timestamp: number }
   | { type: "loop_error"; error: string; heartbeat: number; timestamp: number };

@@ -99,7 +99,11 @@ export abstract class AgentLoop {
       const state = await this.observe();
       state.lastActionResult = this.lastResult;
       this.lastState = state;
-      this.emit({ type: "observe_complete", state, timestamp: Date.now() });
+      // Note: SingleAgent emits its own observe_complete with the board text.
+      // Base class emits a fallback without board for other subclasses.
+      if (!(state.observations as any)?.["board"]) {
+        this.emit({ type: "observe_complete", state, board: "", timestamp: Date.now() });
+      }
 
       // 2. EVALUATE
       const scoredActions = await this.evaluate(state);

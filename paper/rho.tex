@@ -1,0 +1,408 @@
+\documentclass[letterpaper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{natbib}
+\usepackage[margin=1in]{geometry}
+
+\title{Rho: A Cognitive Architecture for Autonomous LLM Agents \\with Reinforcement Learning--Inspired Memory and Policy}
+
+\author{
+  J.\ Nesfield\thanks{Corresponding author. \texttt{jnesfield@proton.me}} \\
+  Independent Researcher \\
+  \and
+  Claude\thanks{AI research collaborator (Anthropic). Contributed to architecture design, implementation, and manuscript preparation.} \\
+  Anthropic
+}
+
+\date{March 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We present \textbf{Rho}, a cognitive architecture for autonomous LLM-based agents that integrates ideas from reinforcement learning, cognitive science, and production systems into a unified framework. Rho's heartbeat loop---Observe, Evaluate, Select, Act, Record---draws from DQN's experience replay \citep{mnih2015human}, Rainbow's prioritized sampling with novelty--usefulness scoring \citep{hessel2018rainbow}, and Soar's production-rule decision cycle \citep{laird2012soar}. 
+The architecture features three key components: (1)~a \emph{blackboard} observation surface inspired by Glyph's information-dense rendering \citep{cheng2025glyph}, providing the LLM with a structured, zoned view of the world; (2)~a \emph{tri-store cognitive memory} system modeled after human episodic, semantic, and procedural memory \citep{tulving1972episodic}, with write, read, and manage operations including reflection, merging, and Ebbinghaus-inspired forgetting; and (3)~a \emph{production-rule policy} engine that constrains the LLM's action selection through codified safety rules, escalation logic, and learned behavioral patterns, following CoALA's cognitive architecture principles \citep{sumers2024cognitive}.
+Actions follow the Options framework \citep{sutton1999between}, supporting both atomic primitives and temporally extended skill sequences within a single heartbeat. We describe the architecture, its theoretical foundations, and its open-source implementation as a standalone TypeScript library.
+\end{abstract}
+
+\section{Introduction}
+
+Large language models (LLMs) have emerged as powerful reasoning engines, but deploying them as \emph{autonomous agents}---systems that observe, decide, and act in environments over extended time horizons---remains an open challenge \citep{wang2024survey, xi2023rise}. Current LLM agents typically operate in one of two modes: reactive chains (observe $\rightarrow$ act) that lack memory and planning \citep{yao2022react}, or monolithic prompt-based systems that stuff all context into a single LLM call, collapsing observation, evaluation, and selection into one undifferentiated step.
+
+This conflation creates several problems. First, the LLM has no structured memory beyond its context window---it cannot reflect on past failures, extract reusable knowledge, or forget irrelevant details. Second, action selection is unconstrained: the LLM can propose dangerous actions (e.g., \texttt{rm~-rf~/}) with no safety layer between proposal and execution. Third, there is no mechanism for detecting when the agent is stuck (impasse) or for escalating to a supervisor.
+
+We propose \textbf{Rho}, a cognitive architecture that addresses these limitations by integrating ideas from three research traditions:
+
+\begin{itemize}[leftmargin=1.5em,itemsep=2pt]
+  \item \textbf{Reinforcement learning}: DQN's experience replay \citep{mnih2015human}, Rainbow's prioritized sampling with novelty$\times$usefulness scoring \citep{hessel2018rainbow}, and the Options framework for temporally extended actions \citep{sutton1999between}.
+  \item \textbf{Cognitive science}: Tulving's episodic/semantic/procedural memory distinction \citep{tulving1972episodic}, Ebbinghaus's forgetting curve \citep{ebbinghaus1885memory}, and Generative Agents' reflection mechanism \citep{park2023generative}.
+  \item \textbf{Production systems}: Soar's propose--evaluate--select decision cycle \citep{laird2012soar}, CoALA's cognitive architecture framework for language agents \citep{sumers2024cognitive}, and Glyph's information-dense observation rendering \citep{cheng2025glyph}.
+\end{itemize}
+
+The result is a heartbeat loop (Figure~\ref{fig:heartbeat}) where each phase has a distinct, well-motivated role: observe via a structured blackboard, evaluate via LLM scoring, select via production-rule policy, act via primitives or skill sequences, and record via tri-store memory with Rainbow-inspired prioritization. We release Rho as an open-source TypeScript library.\footnote{\url{https://github.com/jnesfield-bot/agent-loop}}
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.92\columnwidth}{
+\small
+\texttt{~~OBSERVE -------> EVALUATE -------> SELECT}\\
+\texttt{~~[Blackboard]~~~~[LLM scores]~~~~[Policy rules]}\\
+\texttt{~~[+3 memory]~~~~~[actions]~~~~~~~[+ greedy]}\\
+\texttt{~~~~~~|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|~~~~~}\\
+\texttt{~~~~~~|~~~~~~~~~~~RECORD <--------- ACT~~~~~}\\
+\texttt{~~~~~~+----------[tri-store]~~~~~~[primitive]}\\
+\texttt{~~~~~~~~~~~~~~~~~[+ replay]~~~~~~[or skill]~~}
+}}
+\caption{The Rho heartbeat loop. Each phase has a distinct computational role. The LLM participates only in Evaluate; all other phases are structured code.}
+\label{fig:heartbeat}
+\end{figure}
+
+
+\section{Background and Related Work}
+
+\subsection{Language Agents and Cognitive Architectures}
+
+\citet{sumers2024cognitive} proposed CoALA (Cognitive Architectures for Language Agents), drawing parallels between LLMs and production systems. In CoALA's framework, an LLM replaces the symbolic rule matcher in classical architectures like Soar \citep{laird2012soar}, while the overall decision cycle---proposal, evaluation, selection---remains structured. Rho implements this vision concretely, with the LLM handling evaluation (scoring candidate actions) while a deterministic policy engine handles selection.
+
+\citet{wang2024survey} surveyed LLM-based multi-agent systems, identifying environmental rules, intervention interfaces, and self-refine frameworks as key organizational patterns. Rho's policy system implements environmental rules as codified production rules, and its escalation mechanism provides the intervention interface.
+
+\subsection{Memory in LLM Agents}
+
+\citet{zhang2024survey} provided a comprehensive survey of memory mechanisms in LLM agents, identifying three key operations---write, manage, and read---and noting that most systems implement writing and reading but neglect management (merging, reflection, forgetting). Rho addresses this gap with explicit manage operations.
+
+The three-store distinction (episodic, semantic, procedural) originates in cognitive psychology \citep{tulving1972episodic, anderson1983architecture}. Generative Agents \citep{park2023generative} demonstrated episodic memory with reflection in LLM agents. MemGPT \citep{packer2023memgpt} proposed OS-like memory management. MACLA \citep{forouzandeh2025macla} showed hierarchical procedural memory with Bayesian selection. Rho integrates all three stores with structured operations and budget-constrained compaction.
+
+\subsection{Reinforcement Learning Foundations}
+
+DQN \citep{mnih2015human} introduced experience replay for stabilizing deep RL. Prioritized experience replay \citep{schaul2016prioritized} improved data efficiency by sampling transitions proportional to their TD error. Rainbow \citep{hessel2018rainbow} combined six extensions---double Q-learning, prioritized replay, dueling networks, multi-step learning, distributional RL, and noisy nets---showing they are largely complementary.
+
+While Rho does not perform gradient-based learning, it adopts Rainbow's key insight: \emph{prioritize experiences by their learning potential}. Our novelty$\times$usefulness priority scoring is the TD-error analog for LLM agents, and our multi-step chaining mirrors Rainbow's $n$-step returns.
+
+The Options framework \citep{sutton1999between} formalized temporally extended actions as policies with initiation sets and termination conditions. Rho implements this as the primitive/skill action distinction: primitives execute in one heartbeat step, while skills are multi-step sequences that execute within a single heartbeat of the outer loop.
+
+\subsection{Visual Context Compression}
+
+Glyph \citep{cheng2025glyph} demonstrated that rendering text as images and processing them with a VLM achieves 3--4$\times$ token compression while preserving comprehension. Their genetic search over rendering parameters (font, layout, spacing) revealed that information density strongly affects model performance. While Rho's blackboard uses text (not images) as the primary observation format---since LLMs process text natively with higher fidelity than OCR---we adopt Glyph's density principles: tight spacing, minimal padding, hierarchical structure, and high data-ink ratio.
+
+
+\section{Architecture}
+
+\subsection{The Heartbeat Loop}
+
+Rho's core is a five-phase heartbeat loop that executes repeatedly until the task is complete or a budget is exhausted:
+
+\begin{algorithm}[h]
+\caption{Rho Heartbeat Loop}
+\label{alg:heartbeat}
+\begin{algorithmic}[1]
+\REQUIRE Task brief $\mathcal{T}$, policy $\Pi$, memory stores $\mathcal{M}$
+\STATE Initialize blackboard $\mathcal{B}$, context $\mathcal{C} \leftarrow \emptyset$
+\FOR{heartbeat $h = 1, 2, \ldots, H_{\max}$}
+  \STATE \textbf{Observe:} Read $\mathcal{M}$, gather environment state, populate $\mathcal{B}$
+  \STATE $\text{board} \leftarrow \textsc{Render}(\mathcal{B}, \text{lens})$
+  \STATE \textbf{Evaluate:} $\{(a_i, v_i, r_i)\}_{i=1}^{k} \leftarrow \textsc{LLM}(\text{board})$
+  \STATE \textbf{Select:} $a^* \leftarrow \textsc{PolicySelect}(\{(a_i, v_i)\}, \Pi, \mathcal{C})$
+  \STATE \textbf{Act:} $\text{result} \leftarrow \textsc{Execute}(a^*)$
+  \STATE \textbf{Record:} Update $\mathcal{C}$, write to $\mathcal{M}$, append replay buffer
+  \IF{$a^*$ is \textsc{Complete} or impasse detected}
+    \STATE \textbf{break}
+  \ENDIF
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+The key design principle is \textbf{separation of concerns}: the LLM participates \emph{only} in the Evaluate phase (scoring candidate actions). All other phases are deterministic, auditable code. This contrasts with typical LLM agent designs where the model simultaneously observes, reasons, and selects in a single generation step.
+
+\subsection{The Blackboard (Observe Phase)}
+\label{sec:blackboard}
+
+The blackboard is the agent's primary observation surface---a zoned canvas of named regions, each containing structured text. It is populated from the agent's state and all three memory stores before each heartbeat.
+
+\paragraph{Zones.} The blackboard consists of named zones with priority ordering and visibility tags:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lcp{4.8cm}}
+\toprule
+\textbf{Zone} & \textbf{Priority} & \textbf{Content} \\
+\midrule
+Header & 100 & Agent ID, heartbeat, time, impasse warnings \\
+Task & 95 & Description, success criteria, constraints \\
+Last Action & 90 & Previous action result, success/failure, output \\
+Episodic & 80 & Recent experiences from episodic memory \\
+Semantic & 75 & Relevant entities/facts for current task \\
+Procedural & 70 & High-confidence learned rules \\
+Policy & 65 & Active safety and lifecycle rules \\
+Memory & 60 & Working memory key-value pairs \\
+Skills & 40 & Available skill descriptions \\
+Scratchpad & 20 & Agent's own notes \\
+\bottomrule
+\end{tabular}
+\caption{Blackboard zones, ordered by rendering priority.}
+\label{tab:zones}
+\end{table}
+
+\paragraph{Lenses.} Different agent roles see different subsets of zones. A \emph{worker} lens shows task, memory, skills, and recent experience but hides inputs and policy details. An \emph{executive} lens shows everything. A \emph{minimal} lens shows only the task. This implements information asymmetry for multi-agent hierarchies \citep{chen2024survey}.
+
+\paragraph{Rendering.} The board renders as dense structured text for the LLM (primary) and as HTML for human dashboards (secondary). Following Glyph's finding that layout density affects comprehension \citep{cheng2025glyph}, we use box-drawing characters for spatial structure, tight line spacing, and hierarchy through indentation rather than redundant labels.
+
+\subsection{Tri-Store Cognitive Memory}
+\label{sec:memory}
+
+Rho implements three memory stores modeled after human cognitive memory types \citep{tulving1972episodic}, each with distinct retention characteristics and access patterns:
+
+\paragraph{Episodic Memory} (``what happened'') stores timestamped transitions from the agent's experience. It is backed by a replay buffer that records every heartbeat's state, candidates, action, and result. This is the raw experience stream from which the other stores are populated via reflection.
+
+\paragraph{Semantic Memory} (``what I know'') stores entities, facts, and relationships extracted from experience or external sources. Entities have confidence scores and access counts. Relationships form a lightweight knowledge graph. Semantic memory is populated by reflecting over episodic patterns (e.g., ``auth module appeared in 8 episodes $\rightarrow$ create entity'').
+
+\paragraph{Procedural Memory} (``how to do things'') stores learned rules, action patterns, and multi-step procedures. Rules have Bayesian confidence scores updated via Laplace smoothing after each success or failure. This store feeds directly into the policy system---learned rules are checked alongside static policy rules during selection.
+
+\paragraph{Memory Operations.} Following the framework of \citet{zhang2024survey}, each store supports three operations:
+
+\begin{itemize}[leftmargin=1.5em,itemsep=2pt]
+  \item \textbf{Write} ($W$): Transform raw observations into stored entries. Episodic writes are automatic (every heartbeat). Semantic and procedural writes occur during reflection.
+  \item \textbf{Read} ($R$): Retrieve relevant entries for the current context. Episodic: temporal/similarity search. Semantic: entity lookup, relationship traversal. Procedural: rule matching.
+  \item \textbf{Manage} ($P$): Process stored information. Three sub-operations:
+  \begin{itemize}[leftmargin=1em,itemsep=1pt]
+    \item \emph{Merge}: Deduplicate entities, combine overlapping facts.
+    \item \emph{Reflect}: Promote episodic patterns to semantic facts and procedural rules.
+    \item \emph{Forget}: Ebbinghaus-inspired decay---$\text{Retention}(t) = e^{-t/\tau} \cdot \text{importance} + \text{recency\_boost}$---with budget-constrained compaction.
+  \end{itemize}
+\end{itemize}
+
+Each store has a configurable budget (default: 1000 episodic, 500 semantic, 200 procedural). When exceeded, the manage operation runs compaction, prioritizing entries by confidence $\times$ access frequency.
+
+\subsection{Rainbow-Inspired Priority Scoring}
+\label{sec:rainbow}
+
+Rainbow \citep{hessel2018rainbow} showed that prioritizing replay transitions by their TD error dramatically improves learning efficiency. In LLM agents, there is no gradient-based TD error, but the analog is clear: some experiences have more \emph{learning potential} than others.
+
+We define a transition's priority as:
+\begin{equation}
+  P(i) \propto \left(\text{novelty}(i) \times \text{usefulness}(i) \times \text{recency}(i)\right)^{\omega}
+\label{eq:priority}
+\end{equation}
+where $\omega$ is a hyperparameter controlling the prioritization strength (default 0.6).
+
+\paragraph{Novelty} measures how surprising a transition was---the TD-error analog:
+\begin{equation}
+  \text{novelty}(i) = 0.6 \cdot (1 - \text{freq}(a_i)) + 0.4 \cdot |\text{outcome}_i - \mathbb{E}[\text{outcome}|a_i]|
+\end{equation}
+where $\text{freq}(a_i)$ is the relative frequency of action type $a_i$ in the buffer, and the second term captures prediction surprise.
+
+\paragraph{Usefulness} estimates remaining learning potential, inspired by distributional RL's insight that variance matters:
+\begin{equation}
+  \text{usefulness}(i) = \min\left(1, ~\mathbb{1}[\text{fail}] \cdot 0.3 + \mathbb{1}[\text{rare}] \cdot 0.2 + 0.5\right)
+\end{equation}
+
+\paragraph{Multi-step chaining.} When a transition is sampled, we also include its temporal neighbors within $\pm 3$ heartbeats of the same episode, mirroring Rainbow's $n$-step returns. This preserves causal context.
+
+\paragraph{Importance sampling correction.} To correct for the non-uniform sampling bias:
+\begin{equation}
+  w_i = \frac{(N \cdot P(i))^{-\beta}}{\max_j w_j}
+\end{equation}
+where $\beta$ controls the degree of correction (default 0.4).
+
+For procedural memory, we additionally track per-rule \emph{outcome distributions}---a sliding window of success/failure outcomes---rather than just the mean confidence. The variance of this distribution indicates how reliable the rule is, directly inspired by distributional RL's insight that modeling the return distribution (not just its mean) improves learning \citep{bellemare2017distributional}.
+
+\subsection{Production-Rule Policy (Select Phase)}
+\label{sec:policy}
+
+The policy engine implements Soar's propose--evaluate--select cycle \citep{laird2012soar} as codified in CoALA \citep{sumers2024cognitive}. A policy file is a JSON document containing ordered production rules, each with a precondition and an effect:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lp{5.5cm}}
+\toprule
+\textbf{Effect} & \textbf{Description} \\
+\midrule
+\texttt{block} & Reject the candidate action \\
+\texttt{override} & Replace with the rule's specified action \\
+\texttt{boost} & Increase candidate's value score \\
+\texttt{filter} & Remove all candidates matching a pattern \\
+\texttt{escalate} & Send message to parent/executive agent \\
+\texttt{log} & Audit trail only \\
+\bottomrule
+\end{tabular}
+\caption{Policy rule effect types.}
+\label{tab:effects}
+\end{table}
+
+Rules are organized in priority tiers: safety ($\geq 1000$), lifecycle (500--999), behavioral (100--499), and preference (1--99). During selection:
+
+\begin{enumerate}[leftmargin=1.5em,itemsep=2pt]
+  \item Sort candidates by LLM-assigned value (from Evaluate).
+  \item Apply boost and filter rules across all candidates.
+  \item For each candidate (highest value first), check block/override/escalate rules.
+  \item If all candidates are blocked, trigger impasse handling.
+  \item Return the first surviving candidate.
+\end{enumerate}
+
+\paragraph{Impasse Detection.} Following Soar's impasse mechanism \citep{laird2012soar}, the agent tracks consecutive failures, repeated actions, and no-progress heartbeats. When thresholds are exceeded, it escalates to a parent agent rather than continuing to flail. This is critical for hierarchical multi-agent systems where workers should know their limits.
+
+\paragraph{Self-Modifying Policy.} Procedural memory rules (learned from experience) are checked alongside static policy rules, with confidence-weighted priority. Over time, the policy grows as the agent accumulates experience---the bridge from hand-written rules to learned behavior, analogous to Soar's chunking mechanism \citep{laird1986chunking}.
+
+\subsection{The Options Framework for Actions}
+\label{sec:options}
+
+Following \citet{sutton1999between}, actions in Rho come in two forms:
+
+\paragraph{Primitive actions} execute atomically within one heartbeat step: file I/O (\texttt{bash}, \texttt{read}, \texttt{write}, \texttt{edit}), search (\texttt{grep}, \texttt{find}), and agent control (\texttt{update\_memory}, \texttt{delegate}, \texttt{message}, \texttt{complete}, \texttt{wait}).
+
+\paragraph{Skill actions} are temporally extended sequences---the ``options'' of the framework. A skill is defined by a \texttt{SKILL.md} file with frontmatter and instructions, plus executable scripts. When the agent selects a skill action, the Act phase plans and executes the full sequence of primitive steps, emitting per-step events for observability. The entire skill executes within a single heartbeat of the outer loop, maintaining the one-action-per-heartbeat invariant at the macro level.
+
+Skills are discovered at startup by scanning configured directories for \texttt{SKILL.md} files. The current skill library includes: \texttt{arxiv-research} (paper search, download, algorithm extraction), \texttt{code-search} (multi-stream semantic search across git repositories), \texttt{skill-sequencer} (compile skills into deterministic sequences), and \texttt{memory} (tri-store cognitive memory operations).
+
+
+\section{Implementation}
+
+Rho is implemented in TypeScript as a standalone library (\texttt{agent-loop}) and as an integrated coding agent (\texttt{rho}) built on the pi coding agent SDK.\footnote{\url{https://github.com/badlogic/pi-mono}}
+
+\paragraph{Abstract Base Class.} \texttt{AgentLoop} defines the heartbeat lifecycle with four abstract methods (\texttt{observe}, \texttt{evaluate}, \texttt{select}, \texttt{act}) plus hooks for setup, teardown, error handling, and transition recording. Subclasses implement the phases for their specific environment.
+
+\paragraph{Concrete Agent.} \texttt{SingleAgent} extends \texttt{AgentLoop} with: blackboard observation (reading all three memory stores), LLM-based evaluation (via the pi SDK), policy-based selection (loading and applying production rules), and primitive/skill execution. It automatically records transitions to the replay buffer and updates the loop context for impasse detection.
+
+\paragraph{Containerization.} The agent runs in Docker with \texttt{ENTRYPOINT ["pi"]} for interactive sessions, providing the same experience as a native pi installation while isolating the agent's environment.
+
+\paragraph{Code Statistics.} The core library comprises ${\sim}$2,300 lines of TypeScript (types, base class, blackboard, agent) and ${\sim}$4,500 lines of JavaScript across 20 skill scripts.
+
+
+\section{Discussion}
+
+\paragraph{Separation of LLM and Code.}
+A central design decision is that the LLM participates \emph{only} in evaluation---proposing and scoring candidate actions. Observation is structured code (blackboard population from memory stores). Selection is deterministic code (policy rules, then greedy). Recording is automatic (memory writes, replay buffer). This separation makes the agent auditable (every decision passes through the policy), safe (dangerous actions are blocked before execution), and debuggable (the board text shows exactly what the LLM saw).
+
+\paragraph{Memory as the Learning Mechanism.}
+Without gradient-based learning, the agent's ``learning'' occurs through memory management. Episodic memory provides raw experience. Reflection distills episodes into semantic facts and procedural rules. Forgetting removes stale information. Over time, the procedural memory grows a library of situation-specific rules with calibrated confidence---a form of policy improvement that does not require parameter updates to the LLM.
+
+\paragraph{Limitations.}
+The current implementation has several limitations. First, the reflection operation (episodic $\rightarrow$ semantic/procedural) uses simple frequency counting and pattern matching rather than LLM-guided extraction. Second, the priority scoring in Equation~\ref{eq:priority} uses hand-tuned weights rather than learned coefficients. Third, we have not yet implemented the full executive--worker hierarchy with delegation and policy propagation. Fourth, formal evaluation on standardized benchmarks is needed to validate the architecture's effectiveness.
+
+\paragraph{Future Work.}
+We plan to: (1)~implement the executive agent with delegation, lens-based observation filtering, and policy injection into workers; (2)~add LLM-guided reflection for higher-quality knowledge extraction; (3)~learn the priority scoring weights from experience via the distillation pipeline; and (4)~evaluate on coding benchmarks (SWE-bench) and interactive environments (WebArena).
+
+
+\section{Conclusion}
+
+We have presented Rho, a cognitive architecture for autonomous LLM agents that draws on reinforcement learning, cognitive science, and production systems. By separating the heartbeat into distinct phases---each with a clear computational role---and by implementing structured memory with Rainbow-inspired prioritization, Rho provides a principled foundation for building agents that remember, learn from experience, and operate safely within policy constraints. The architecture is released as open-source software, and we hope it serves as a useful substrate for future research on autonomous LLM agents.
+
+
+\bibliographystyle{plainnat}
+
+\begin{thebibliography}{25}
+
+\bibitem[Anderson(1983)]{anderson1983architecture}
+Anderson, J.~R. (1983).
+\newblock \emph{The Architecture of Cognition}.
+\newblock Harvard University Press.
+
+\bibitem[Bellemare et~al.(2017)]{bellemare2017distributional}
+Bellemare, M.~G., Dabney, W., and Munos, R. (2017).
+\newblock A distributional perspective on reinforcement learning.
+\newblock In \emph{ICML}.
+
+\bibitem[Chen et~al.(2024)]{chen2024survey}
+Chen, Y. et~al. (2024).
+\newblock A survey on {LLM}-based multi-agent system: Recent advances and new frontiers.
+\newblock \emph{arXiv preprint arXiv:2412.17481}.
+
+\bibitem[Cheng et~al.(2025)]{cheng2025glyph}
+Cheng, Y. et~al. (2025).
+\newblock Glyph: Scaling long-context language model with visual text compression.
+\newblock \emph{arXiv preprint arXiv:2510.17800}.
+
+\bibitem[Ebbinghaus(1885)]{ebbinghaus1885memory}
+Ebbinghaus, H. (1885).
+\newblock \emph{{\"U}ber das Ged{\"a}chtnis}.
+\newblock Duncker \& Humblot.
+
+\bibitem[Forouzandeh et~al.(2025)]{forouzandeh2025macla}
+Forouzandeh, S. et~al. (2025).
+\newblock Learning hierarchical procedural memory for {LLM} agents through {B}ayesian selection.
+\newblock \emph{arXiv preprint arXiv:2512.18950}.
+
+\bibitem[Hessel et~al.(2018)]{hessel2018rainbow}
+Hessel, M., Modayil, J., van Hasselt, H., et~al. (2018).
+\newblock Rainbow: Combining improvements in deep reinforcement learning.
+\newblock In \emph{AAAI}.
+
+\bibitem[Laird(2012)]{laird2012soar}
+Laird, J.~E. (2012).
+\newblock \emph{The Soar Cognitive Architecture}.
+\newblock MIT Press.
+
+\bibitem[Laird et~al.(1986)]{laird1986chunking}
+Laird, J.~E., Rosenbloom, P.~S., and Newell, A. (1986).
+\newblock Chunking in {S}oar: The anatomy of a general learning mechanism.
+\newblock \emph{Machine Learning}, 1(1):11--46.
+
+\bibitem[Mnih et~al.(2015)]{mnih2015human}
+Mnih, V., Kavukcuoglu, K., Silver, D., et~al. (2015).
+\newblock Human-level control through deep reinforcement learning.
+\newblock \emph{Nature}, 518(7540):529--533.
+
+\bibitem[Packer et~al.(2023)]{packer2023memgpt}
+Packer, C. et~al. (2023).
+\newblock {MemGPT}: Towards {LLM}s as operating systems.
+\newblock \emph{arXiv preprint arXiv:2310.08560}.
+
+\bibitem[Park et~al.(2023)]{park2023generative}
+Park, J.~S. et~al. (2023).
+\newblock Generative agents: Interactive simulacra of human behavior.
+\newblock In \emph{UIST}.
+
+\bibitem[Schaul et~al.(2016)]{schaul2016prioritized}
+Schaul, T., Quan, J., Antonoglou, I., and Silver, D. (2016).
+\newblock Prioritized experience replay.
+\newblock In \emph{ICLR}.
+
+\bibitem[Sumers et~al.(2024)]{sumers2024cognitive}
+Sumers, T.~R., Yao, S., Narasimhan, K., and Griffiths, T.~L. (2024).
+\newblock Cognitive architectures for language agents.
+\newblock \emph{Transactions on Machine Learning Research}.
+
+\bibitem[Sutton et~al.(1999)]{sutton1999between}
+Sutton, R.~S., Precup, D., and Singh, S. (1999).
+\newblock Between {MDP}s and semi-{MDP}s: A framework for temporal abstraction in reinforcement learning.
+\newblock \emph{Artificial Intelligence}, 112(1):181--211.
+
+\bibitem[Tulving(1972)]{tulving1972episodic}
+Tulving, E. (1972).
+\newblock Episodic and semantic memory.
+\newblock In Tulving, E. and Donaldson, W., editors, \emph{Organization of Memory}. Academic Press.
+
+\bibitem[Wang et~al.(2024)]{wang2024survey}
+Wang, L. et~al. (2024).
+\newblock A survey on large language model based autonomous agents.
+\newblock \emph{Frontiers of Computer Science}, 18(6):186345.
+
+\bibitem[Xi et~al.(2023)]{xi2023rise}
+Xi, Z. et~al. (2023).
+\newblock The rise and potential of large language model based agents: A survey.
+\newblock \emph{arXiv preprint arXiv:2309.07864}.
+
+\bibitem[Yao et~al.(2022)]{yao2022react}
+Yao, S. et~al. (2022).
+\newblock {ReAct}: Synergizing reasoning and acting in language models.
+\newblock In \emph{ICLR}.
+
+\bibitem[Zhang et~al.(2024)]{zhang2024survey}
+Zhang, Z. et~al. (2024).
+\newblock A survey on the memory mechanism of large language model based agents.
+\newblock \emph{arXiv preprint arXiv:2404.13501}.
+
+\end{thebibliography}
+
+\end{document}

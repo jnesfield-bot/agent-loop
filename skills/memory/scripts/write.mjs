@@ -133,11 +133,28 @@ function writeRule(ruleJson) {
 
   if (existing) {
     // Bayesian update: adjust confidence based on new evidence
-    const totalTrials = (existing.successes ?? 0) + (existing.failures ?? 0) + 1;
     const success = rule.success !== false;
     const successes = (existing.successes ?? 0) + (success ? 1 : 0);
     const failures = (existing.failures ?? 0) + (success ? 0 : 1);
+    const totalTrials = successes + failures;
     const confidence = (successes + 1) / (totalTrials + 2); // Laplace smoothing
+
+    // Rainbow-inspired: track outcome distribution, not just mean
+    // Variance tells us how reliable this rule is
+    const outcomes = existing.outcomes ?? [];
+    outcomes.push(success ? 1 : 0);
+    if (outcomes.length > 50) outcomes.shift(); // sliding window
+    const mean = outcomes.reduce((s, v) => s + v, 0) / outcomes.length;
+    const variance = outcomes.reduce((s, v) => s + (v - mean) ** 2, 0) / outcomes.length;
+
+    // Novelty: how surprising was this outcome?
+    // If we expected success (high confidence) but failed → high novelty
+    const expectedOutcome = existing.confidence ?? 0.5;
+    const actualOutcome = success ? 1 : 0;
+    const novelty = Math.abs(actualOutcome - expectedOutcome);
+
+    // Usefulness: inverse of confidence stability — uncertain rules have more to teach
+    const usefulness = Math.sqrt(variance) + (1 - confidence) * 0.5;
 
     rules[rule.id] = {
       ...existing,
@@ -145,6 +162,10 @@ function writeRule(ruleJson) {
       confidence,
       successes,
       failures,
+      outcomes,
+      variance: +variance.toFixed(4),
+      novelty: +novelty.toFixed(4),
+      usefulness: +usefulness.toFixed(4),
       updatedAt: new Date().toISOString(),
       usageCount: (existing.usageCount ?? 0) + 1,
     };
@@ -156,12 +177,23 @@ function writeRule(ruleJson) {
       confidence: rule.confidence ?? 0.5,
       successes: rule.success !== false ? 1 : 0,
       failures: rule.success === false ? 1 : 0,
+      outcomes: [rule.success !== false ? 1 : 0],
+      variance: 0,
+      novelty: 0.5,  // First time = moderate novelty
+      usefulness: 0.75,  // New rules are highly useful
       usageCount: 0,
     };
   }
 
   saveStore("rules.json", rules);
-  console.log(JSON.stringify({ written: "rule", id: rule.id, confidence: rules[rule.id].confidence }));
+  const r = rules[rule.id];
+  console.log(JSON.stringify({
+    written: "rule", id: rule.id,
+    confidence: r.confidence,
+    variance: r.variance,
+    novelty: r.novelty,
+    usefulness: r.usefulness,
+  }));
 }
 
 function writeProcedure(procJson) {

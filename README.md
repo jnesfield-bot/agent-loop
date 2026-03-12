@@ -1,8 +1,10 @@
 # Agent Loop
 
-A standalone RL-inspired autonomous agent framework. Heartbeat engine, tri-store cognitive memory, policy rules, skills, replay buffer, and semantic code search — **no pi TUI, no interactive mode**. Just the autonomous loop you can embed in any system.
+A standalone RL-inspired autonomous agent framework. Heartbeat engine, tri-store cognitive memory, Rainbow-inspired priority scoring, policy rules, skills, replay buffer, and semantic code search — **no pi TUI, no interactive mode**. Just the autonomous loop you can embed in any system.
 
 > **Looking for the full coding agent?** See [rho](https://github.com/jnesfield-bot/rho) — pi + agent-loop integrated into a complete autonomous coding agent.
+
+> **📄 Paper**: See [`paper/rho.tex`](paper/rho.tex) ([PDF](paper/rho.pdf)) — *"Rho: A Cognitive Architecture for Autonomous LLM Agents with Reinforcement Learning–Inspired Memory and Policy"* by J. Nesfield & Claude.
 
 ## What This Is
 
@@ -10,9 +12,10 @@ A library that provides:
 
 - **Heartbeat loop**: Observe → Evaluate → Select → Act → Record
 - **Tri-store memory**: Episodic (what happened), semantic (what I know), procedural (how to do things) — with write, read, manage (merge/reflect/forget) operations. Inspired by human cognitive memory and arXiv:2404.13501.
+- **Rainbow-inspired replay**: Priority = novelty × usefulness (arXiv:1710.02298). Multi-step chaining, importance sampling correction, outcome distributions for procedural rules.
 - **Policy engine**: Production-rule system (Soar-style) that constrains the select phase — safety blocks, escalation, skill boosts, impasse handling
 - **Skills**: Self-contained capability packages (memory, policy, code-search, arxiv-research, skill-sequencer, blackboard, replay-buffer)
-- **Replay buffer**: Multimodal experience memory with indexing, querying, sampling (episodic memory backing store)
+- **Replay buffer**: Multimodal experience memory with indexing, querying, 5 sampling strategies (episodic memory backing store)
 - **Blackboard**: Segmented observation board with lens-based visibility — unified read surface for all 3 memory stores
 - **Code search**: Multi-stream semantic search across git repos
 
@@ -31,7 +34,8 @@ A library that provides:
 │       │    ┌──────────┐  ┌───────────┴──────┐            │
 │       └────│  RECORD  │<─│      ACT         │            │
 │            │  replay  │  │ primitive | skill │            │
-│            │  buffer  │  └──────────────────┘            │
+│            │+ rainbow │  └──────────────────┘            │
+│            │ priority │                                   │
 │            └──────────┘                                   │
 └───────────────────────────────────────────────────────────┘
 ```
@@ -39,8 +43,6 @@ A library that provides:
 ## Quick Start
 
 ### Docker (interactive pi session)
-
-Opens a full interactive pi TUI — same experience as running `pi` locally.
 
 ```bash
 git clone https://github.com/jnesfield-bot/agent-loop.git
@@ -56,6 +58,52 @@ git clone https://github.com/jnesfield-bot/agent-loop.git
 cd agent-loop && npm install
 ANTHROPIC_API_KEY=sk-ant-... npx tsx src/main.ts [work-directory]
 ```
+
+## Rainbow-Inspired Memory Prioritization
+
+Adapted from Rainbow DQN (arXiv:1710.02298) — the idea that **not all experiences are equally worth replaying**. Six DQN improvements mapped to agent memory:
+
+| Rainbow Component | DQN Role | Agent Memory Analog |
+|---|---|---|
+| **Prioritized Replay** | Sample ∝ \|TD error\| | Priority = novelty × usefulness |
+| **Multi-step Returns** | n-step reward propagation | Temporal chaining (±3 heartbeats) |
+| **Distributional RL** | Learn return distribution | Outcome variance per rule |
+| **Double Q** | Decouple select from eval | Our evaluate/select separation |
+| **Dueling Networks** | State value vs action advantage | State vs action attribution |
+| **Noisy Nets** | Learned exploration | Exploration policy tuning |
+
+### Priority Scoring
+
+```
+P(i) ∝ (novelty × usefulness × recency)^ω
+
+Novelty   = 0.6·(1 - freq(action)) + 0.4·|outcome - E[outcome]|
+Usefulness = min(1, fail_bonus + rarity_bonus + 0.5)
+Recency   = 0.3 + 0.7·(rank / N)
+```
+
+New transitions enter with maximum priority (bias towards recent). Importance sampling weights correct for non-uniform sampling: `w_i = (N·P(i))^(-β) / max(w)`.
+
+### 5 Sampling Strategies
+
+```bash
+node skills/replay-buffer/scripts/sample.mjs --buffer ./buf --size 32 --strategy rainbow
+# Strategies: uniform, prioritized, recent, failures, rainbow
+# Rainbow params: --omega 0.6 --beta 0.4
+```
+
+### Outcome Distributions (Distributional RL Analog)
+
+Procedural rules track a sliding window of outcomes, not just mean confidence:
+
+```
+confidence = (successes + 1) / (total + 2)    # Laplace smoothing
+variance   = Σ(outcome - mean)² / N           # How reliable?
+novelty    = |actual - expected|               # How surprising?
+usefulness = √variance + (1-confidence)·0.5    # Learning potential
+```
+
+High-variance rules have more to teach. Surprising outcomes get prioritized for replay.
 
 ## Tri-Store Cognitive Memory
 
@@ -99,42 +147,16 @@ node skills/memory/scripts/inspect.mjs --dir /tmp/mem
 
 Production-rule system inspired by Soar/CoALA (arXiv:2309.02427). The policy file
 is a set of codified rules that the `select()` phase checks **before** falling back
-to LLM-scored greedy selection. Rules have preconditions and effects.
-
-```json
-{
-  "rules": [
-    {
-      "id": "safety-no-rm-rf",
-      "priority": 1000,
-      "precondition": { "type": "action_match", "field": "params.command", "pattern": "rm\\s+-rf\\s+/" },
-      "effect": "block",
-      "message": "Blocked: dangerous rm command"
-    },
-    {
-      "id": "escalate-on-stuck",
-      "priority": 900,
-      "precondition": { "type": "consecutive_failures", "count": 3 },
-      "effect": "escalate",
-      "message": "3 failures — requesting executive guidance"
-    }
-  ]
-}
-```
+to LLM-scored greedy selection.
 
 **Priority tiers**: 1000+ safety, 500-999 lifecycle, 100-499 behavioral, 1-99 preference.
 
-**Effects**: `block` (reject action), `override` (replace), `boost` (adjust score), `filter` (remove candidates), `rewrite` (transform), `escalate` (ask parent), `log` (audit).
+**Effects**: `block`, `override`, `boost`, `filter`, `rewrite`, `escalate`, `log`.
 
-**Impasse handling** (from Soar): When no rules match, candidates exhausted, or repeated failures → escalate to executive. Workers know their limits.
-
-**Self-modifying**: Agents can write new rules from experience — the bridge from static policy to learned policy.
+**Impasse handling** (from Soar): Consecutive failures, repeated actions, no-progress → escalate. Workers know their limits.
 
 ```bash
-# Validate a policy
 node skills/policy/scripts/validate.mjs policies/worker-default.json
-
-# Evaluate rules against candidates (blocks rm -rf, selects safe alternative)
 node skills/policy/scripts/evaluate.mjs --policy policies/worker-default.json --candidates candidates.json
 ```
 
@@ -148,44 +170,7 @@ node skills/policy/scripts/evaluate.mjs --policy policies/worker-default.json --
 | **arxiv-research** | search, metadata, download-source, extract-algorithms | Academic paper pipeline |
 | **skill-sequencer** | compile, run, list | Compile skills → deterministic sequences |
 | **blackboard** | render, read-scratchpad, read-memory | Segmented observation board (legacy — now in src/blackboard.ts) |
-| **replay-buffer** | record, query, replay, sample | Multimodal experience memory (episodic backing store) |
-
-### Code Search (arXiv:2408.11058)
-
-Search functions/classes by natural language across git repos. Multi-stream
-scoring: TF-IDF, name/docstring identity matching, component decomposition.
-
-```bash
-# Single-strip: clone + index + search in one action
-node skills/code-search/scripts/batch-search.mjs "handle authentication" \
-  --repo https://github.com/user/repo.git --top 5
-
-# Or step-by-step
-node skills/code-search/scripts/index-repo.mjs ./my-project --output index.json
-node skills/code-search/scripts/search.mjs "parse URL parameters" --index index.json
-```
-
-### Other Skills
-
-```bash
-# arXiv: search + download + extract algorithms
-node skills/arxiv-research/scripts/search.mjs "attention is all you need"
-node skills/arxiv-research/scripts/download-source.mjs 1706.03762 /tmp/src
-node skills/arxiv-research/scripts/extract-algorithms.mjs /tmp/src
-
-# Compile a skill into a deterministic sequence
-node skills/skill-sequencer/scripts/compile.mjs skills/arxiv-research \
-  "Find and implement DQN from arXiv:1312.5602" sequences/dqn.json
-node skills/skill-sequencer/scripts/run.mjs sequences/dqn.json
-
-# Blackboard: render state through a lens
-echo '{"heartbeat":1,"currentTask":{"description":"test"},...}' | \
-  node skills/blackboard/scripts/render.mjs --lens worker
-
-# Replay buffer: query and sample
-node skills/replay-buffer/scripts/query.mjs --buffer ./buffer --success false
-node skills/replay-buffer/scripts/sample.mjs --buffer ./buffer --size 32 --strategy prioritized
-```
+| **replay-buffer** | record, query, replay, sample | Rainbow-prioritized experience replay |
 
 ## Actions
 
@@ -197,7 +182,7 @@ node skills/replay-buffer/scripts/sample.mjs --buffer ./buffer --size 32 --strat
 | Search | `grep`, `find`, `ls` |
 | Control | `update_memory`, `delegate`, `message`, `complete`, `wait` |
 
-**Skills** (multi-step sequence, one heartbeat):
+**Skills** (multi-step sequence via Options framework — Sutton, Precup & Singh 1999):
 
 ```json
 { "kind": "skill", "skillName": "arxiv-research", "goal": "Extract DQN algorithm from 1312.5602" }
@@ -206,6 +191,10 @@ node skills/replay-buffer/scripts/sample.mjs --buffer ./buffer --size 32 --strat
 ## Project Structure
 
 ```
+paper/
+├── rho.tex           LaTeX source — our arXiv paper
+└── rho.pdf           Compiled PDF
+
 src/
 ├── types.ts          Core types (State, Action, LoopContext, LoopEvent, ...)
 ├── agent-loop.ts     Abstract base class — heartbeat loop + recordTransition
@@ -221,39 +210,45 @@ skills/
 ├── arxiv-research/   Search arXiv, download LaTeX, extract algorithms
 ├── skill-sequencer/  Compile skills → deterministic JSON sequences
 ├── blackboard/       Legacy lens rendering (superseded by src/blackboard.ts)
-└── replay-buffer/    Multimodal experience replay (record/query/sample/replay)
+└── replay-buffer/    Rainbow-prioritized experience replay (record/query/sample/replay)
 
 policies/
 └── worker-default.json   Default worker policy (safety + escalation + preferences)
 
-sequences/
-└── implement-dqn.json    Example compiled sequence
+tests/
+├── rho-prompts.md    13 interactive test prompts for TUI
+└── ...
 ```
 
 ## References
 
+- **Rainbow** — Hessel et al. [arXiv:1710.02298](https://arxiv.org/abs/1710.02298). Prioritized replay, distributional RL → novelty × usefulness scoring.
 - **CoALA** — Sumers, Yao et al. [arXiv:2309.02427](https://arxiv.org/abs/2309.02427). Cognitive architectures → production-rule policy.
-- **LLM-MAS** — Chen et al. [arXiv:2412.17481](https://arxiv.org/abs/2412.17481). Multi-agent rules, intervention, communication.
-- **RepoRift** — Jain et al. [arXiv:2408.11058](https://arxiv.org/abs/2408.11058). Multi-stream semantic code search.
 - **Memory Survey** — Zhang et al. [arXiv:2404.13501](https://arxiv.org/abs/2404.13501). Tri-store memory (write/manage/read).
-- **MACLA** — Forouzandeh et al. [arXiv:2512.18950](https://arxiv.org/abs/2512.18950). Hierarchical procedural memory.
 - **Glyph** — Cheng et al. [arXiv:2510.17800](https://arxiv.org/abs/2510.17800). Visual context compression → dense layout principles.
 - **DQN** — Mnih et al. [arXiv:1312.5602](https://arxiv.org/abs/1312.5602). Experience replay buffer.
+- **MACLA** — Forouzandeh et al. [arXiv:2512.18950](https://arxiv.org/abs/2512.18950). Hierarchical procedural memory with Bayesian selection.
+- **Latent Context Compilation** — [arXiv:2602.21221](https://arxiv.org/abs/2602.21221). Context compression into portable buffer tokens. Analogous to memory compaction.
+- **C3 (Context Cascade Compression)** — [arXiv:2511.15244](https://arxiv.org/abs/2511.15244). 40× text compression; forgetting pattern mirrors Ebbinghaus human memory decay.
+- **IC-Former (In-Context Former)** — [arXiv:2406.13618](https://arxiv.org/abs/2406.13618). Cross-attention context compression with learnable digest tokens.
 - **Learning by Cheating** — Chen et al. [arXiv:1912.12294](https://arxiv.org/abs/1912.12294). Executive/worker hierarchy.
 - **Options Framework** — Sutton, Precup & Singh (1999). Primitive + skill actions.
+- **RepoRift** — Jain et al. [arXiv:2408.11058](https://arxiv.org/abs/2408.11058). Multi-stream semantic code search.
 - **Pi & Mom** — [github.com/badlogic/pi-mono](https://github.com/badlogic/pi-mono). SDK foundation.
 
 ## Status
 
-- ✅ Heartbeat loop with primitives + skills
+- ✅ Heartbeat loop with primitives + skills (Options framework)
 - ✅ Blackboard canvas (zoned, lens-filtered, text+HTML dual render, Glyph-dense layout)
 - ✅ Tri-store cognitive memory (episodic/semantic/procedural + merge/reflect/forget)
+- ✅ Rainbow-inspired replay: novelty × usefulness priority, multi-step chaining, IS weights, outcome distributions
 - ✅ Policy engine (production rules, safety, escalation, impasse detection)
-- ✅ Proper observe (blackboard + 3 memory stores), select (policy → greedy), record (tri-store write)
-- ✅ Replay buffer with query/sample/replay (episodic backing store)
+- ✅ Replay buffer with 5 strategies (uniform/prioritized/recent/failures/rainbow)
 - ✅ Skill sequencer (compile → run)
 - ✅ Semantic code search (multi-stream, multi-repo)
+- ✅ arXiv paper ([`paper/rho.pdf`](paper/rho.pdf))
 - 🔜 Executive + Worker agents with delegation and policy propagation
+- 🔜 Context compression integration (Latent Context Compilation / C3 / IC-Former)
 - 📋 Trace distillation, learned policies, self-modifying rules
 
 ## License

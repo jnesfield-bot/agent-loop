@@ -1,0 +1,19 @@
+{
+  "name": "agent-loop",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node --loader ts-node/esm src/main.ts",
+    "dev": "npx tsx src/main.ts"
+  },
+  "dependencies": {
+    "@mariozechner/pi-coding-agent": "^0.57.1",
+    "@mariozechner/pi-agent-core": "*",
+    "@mariozechner/pi-ai": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "tsx": "^4.19.0"
+  }
+}

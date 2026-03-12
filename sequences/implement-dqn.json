@@ -1,0 +1,107 @@
+{
+  "name": "find-and-implement-the-dqn-algorithm-from-arxiv-1312-5602",
+  "description": "Find and implement the DQN algorithm from arXiv:1312.5602",
+  "sourceSkill": "arxiv-research",
+  "goal": "Find and implement the DQN algorithm from arXiv:1312.5602",
+  "variables": {},
+  "steps": [
+    {
+      "index": 0,
+      "description": "Search arXiv for \"1312.5602\"",
+      "action": {
+        "kind": "primitive",
+        "type": "bash",
+        "description": "Search arXiv for \"1312.5602\"",
+        "params": {
+          "command": "node skills/arxiv-research/scripts/search.mjs \"1312.5602\" --max 5"
+        }
+      },
+      "onFailure": "abort",
+      "captureAs": "search_results",
+      "condition": null
+    },
+    {
+      "index": 1,
+      "description": "Get metadata for paper 1312.5602",
+      "action": {
+        "kind": "primitive",
+        "type": "bash",
+        "description": "Get metadata for paper 1312.5602",
+        "params": {
+          "command": "node skills/arxiv-research/scripts/metadata.mjs 1312.5602"
+        }
+      },
+      "onFailure": "abort",
+      "captureAs": "paper_metadata",
+      "condition": null
+    },
+    {
+      "index": 2,
+      "description": "Download LaTeX source for 1312.5602",
+      "action": {
+        "kind": "primitive",
+        "type": "bash",
+        "description": "Download LaTeX source for 1312.5602",
+        "params": {
+          "command": "node skills/arxiv-research/scripts/download-source.mjs 1312.5602 /tmp/paper-src-13125602"
+        }
+      },
+      "onFailure": "abort",
+      "captureAs": "download_result",
+      "condition": null
+    },
+    {
+      "index": 3,
+      "description": "Extract algorithms and pseudocode from source",
+      "action": {
+        "kind": "primitive",
+        "type": "bash",
+        "description": "Extract algorithms and pseudocode from source",
+        "params": {
+          "command": "node skills/arxiv-research/scripts/extract-algorithms.mjs /tmp/paper-src-13125602"
+        }
+      },
+      "onFailure": "abort",
+      "captureAs": "extracted_algorithms",
+      "condition": null
+    },
+    {
+      "index": 4,
+      "description": "Save extracted algorithm to workspace for implementation",
+      "action": {
+        "kind": "primitive",
+        "type": "bash",
+        "description": "Save extracted algorithm to workspace for implementation",
+        "params": {
+          "command": "node skills/arxiv-research/scripts/extract-algorithms.mjs /tmp/paper-src-13125602 > /tmp/algorithm-extract.json"
+        }
+      },
+      "onFailure": "continue",
+      "captureAs": "algorithm_json",
+      "condition": null
+    }
+  ],
+  "compiledAt": "2026-03-12T05:47:01.241Z",
+  "compiledFrom": "skills/arxiv-research/SKILL.md",
+  "metadata": {
+    "skillDescription": "Search arXiv papers, download LaTeX source, extract algorithms and equations, and implement them in code. Use when a task involves academic research, finding papers, understanding algorithms, or implementing methods from publications.",
+    "availableScripts": [
+      {
+        "name": "download-source",
+        "description": "Download and extract LaTeX source for an arXiv paper."
+      },
+      {
+        "name": "extract-algorithms",
+        "description": "Extract algorithm blocks from LaTeX source files."
+      },
+      {
+        "name": "metadata",
+        "description": "Get metadata for one or more arXiv papers by ID."
+      },
+      {
+        "name": "search",
+        "description": "Search arXiv papers."
+      }
+    ]
+  }
+}

@@ -71,6 +71,16 @@ export abstract class AgentLoop {
     return false; // stop by default
   }
 
+  /** Called after act to record the transition. Override to enable replay buffer. */
+  protected async recordTransition(
+    _state: State,
+    _candidates: ScoredAction[],
+    _selected: Action,
+    _result: ActionResult,
+  ): Promise<void> {
+    // No-op by default. SingleAgent overrides to write to replay buffer.
+  }
+
   // ── The Heartbeat ──────────────────────────────────────────
 
   /** Execute a single heartbeat: Observe → Evaluate → Select → Act */
@@ -117,6 +127,9 @@ export abstract class AgentLoop {
       const result = await this.act(action);
       this.lastResult = result;
       this.emit({ type: "act_complete", result, timestamp: Date.now() });
+
+      // 5. RECORD — store transition in replay buffer
+      await this.recordTransition(state, scoredActions, action, result);
 
       this.emit({
         type: "heartbeat_end",

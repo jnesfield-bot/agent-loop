@@ -28,9 +28,9 @@ import {
   SettingsManager,
   AgentSession,
 } from "@mariozechner/pi-coding-agent";
-import { existsSync, readFileSync, readdirSync } from "fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync, mkdirSync, copyFileSync, statSync } from "fs";
 import { writeFile, readFile, mkdir } from "fs/promises";
-import { join } from "path";
+import { join, basename } from "path";
 import { AgentLoop } from "./agent-loop.js";
 import type {
   Action,
@@ -82,6 +82,10 @@ export interface SingleAgentConfig extends AgentLoopConfig {
   model?: string;
   task?: TaskBrief;
   systemPrompt?: string;
+  /** Directory for the replay buffer. Set to enable automatic recording. */
+  replayBufferDir?: string;
+  /** Episode ID for grouping transitions. Auto-generated if not set. */
+  episodeId?: string;
 }
 
 // ── Implementation ───────────────────────────────────────
@@ -95,11 +99,16 @@ export class SingleAgent extends AgentLoop {
   private actionHistory: ActionResult[] = [];
   private inputs: Input[] = [];
   private skills: SkillDescriptor[] = [];
+  private replayBufferDir: string | null;
+  private replayIndex: any = null;
+  private episodeId: string;
 
   constructor(config: SingleAgentConfig) {
     super(config);
     this.agentConfig = config;
     this.task = config.task ?? null;
+    this.replayBufferDir = config.replayBufferDir ?? null;
+    this.episodeId = config.episodeId ?? `ep-${Date.now().toString(36)}`;
   }
 
   // ── Setup / Teardown ─────────────────────────────────────
@@ -112,6 +121,7 @@ export class SingleAgent extends AgentLoop {
 
     await this.loadMemory();
     this.skills = this.discoverSkills();
+    this.initReplayBuffer();
 
     // Initialize pi SDK
     const authStorage = AuthStorage.create(join(workDir, "auth.json"));
@@ -173,6 +183,260 @@ export class SingleAgent extends AgentLoop {
   protected async teardown(): Promise<void> {
     await this.saveMemory();
     await this.saveHistory();
+    this.finalizeReplayEpisode();
+  }
+
+  // ── Replay Buffer ─────────────────────────────────────────
+
+  private initReplayBuffer(): void {
+    if (!this.replayBufferDir) return;
+    const dir = this.replayBufferDir;
+    for (const sub of ["transitions", "boards", "media", "episodes"]) {
+      mkdirSync(join(dir, sub), { recursive: true });
+    }
+    const indexPath = join(dir, "index.json");
+    if (existsSync(indexPath)) {
+      this.replayIndex = JSON.parse(readFileSync(indexPath, "utf-8"));
+    } else {
+      this.replayIndex = {
+        bufferVersion: 1,
+        agentId: this.config.agentId,
+        created: new Date().toISOString(),
+        transitions: [],
+        episodes: [],
+        stats: { totalTransitions: 0, totalEpisodes: 0, successRate: 0, avgDurationMs: 0 },
+      };
+    }
+    // Register episode
+    if (!this.replayIndex.episodes.find((e: any) => e.id === this.episodeId)) {
+      this.replayIndex.episodes.push({
+        id: this.episodeId,
+        start: this.replayIndex.stats.totalTransitions + 1,
+        end: null,
+        status: "running",
+        task: this.task?.description ?? "",
+      });
+      this.replayIndex.stats.totalEpisodes = this.replayIndex.episodes.length;
+    }
+    this.saveReplayIndex();
+  }
+
+  /**
+   * Record one heartbeat transition into the replay buffer.
+   * Called automatically by the base loop after every act().
+   */
+  protected override async recordTransition(
+    state: State,
+    candidates: ScoredAction[],
+    selected: Action,
+    result: ActionResult,
+  ): Promise<void> {
+    if (!this.replayBufferDir || !this.replayIndex) return;
+
+    const id = this.replayIndex.stats.totalTransitions + 1;
+    const paddedId = String(id).padStart(6, "0");
+
+    // Render board snapshot for this state
+    const board = this.renderBoardText(state);
+
+    // Save board
+    const boardRef = `boards/${paddedId}.txt`;
+    writeFileSync(join(this.replayBufferDir, boardRef), board);
+
+    // Collect attachments from the result
+    const attachments: any[] = [];
+    const mediaDir = join(this.replayBufferDir, "media", paddedId);
+
+    // Attach skill trace if present
+    if (result.skillTrace) {
+      mkdirSync(mediaDir, { recursive: true });
+      const tracePath = join(mediaDir, "skill-trace.json");
+      writeFileSync(tracePath, JSON.stringify(result.skillTrace, null, 2));
+      attachments.push({
+        name: "skill-trace.json",
+        type: "json",
+        ref: `media/${paddedId}/skill-trace.json`,
+        size: statSync(tracePath).size,
+      });
+    }
+
+    // Attach result output if substantial
+    if (result.output && result.output.length > 200) {
+      mkdirSync(mediaDir, { recursive: true });
+      const outPath = join(mediaDir, "output.txt");
+      writeFileSync(outPath, result.output);
+      attachments.push({
+        name: "output.txt",
+        type: "text",
+        ref: `media/${paddedId}/output.txt`,
+        size: result.output.length,
+      });
+    }
+
+    // Copy any artifact files
+    for (const artifact of result.artifacts) {
+      try {
+        const fullPath = artifact.startsWith("/") ? artifact : join(this.config.workDir, artifact);
+        if (existsSync(fullPath)) {
+          mkdirSync(mediaDir, { recursive: true });
+          const name = basename(fullPath);
+          copyFileSync(fullPath, join(mediaDir, name));
+          attachments.push({
+            name,
+            type: "file",
+            ref: `media/${paddedId}/${name}`,
+            size: statSync(fullPath).size,
+          });
+        }
+      } catch { /* skip unreadable artifacts */ }
+    }
+
+    // Auto-tags
+    const tags: Record<string, string> = {
+      actionType: selected.kind === "skill" ? `skill:${(selected as SkillAction).skillName}` : (selected as PrimitiveAction).type,
+    };
+    if (selected.kind === "skill") tags.skill = (selected as SkillAction).skillName;
+
+    // Compact state summary
+    const stateSummary = {
+      taskDescription: state.currentTask?.description ?? null,
+      memoryKeys: Object.keys(state.memory ?? {}),
+      fileCount: ((state.observations?.workspace_files as string) ?? "").split("\n").filter(Boolean).length,
+      inputCount: state.inputs.length,
+      childCount: state.children.length,
+      skillCount: state.availableSkills.length,
+    };
+
+    // Metrics
+    const selectedValue = candidates.length > 0
+      ? Math.max(...candidates.map(c => c.value))
+      : 0;
+
+    const transition = {
+      id,
+      heartbeat: this.heartbeatCount,
+      timestamp: Date.now(),
+      agentId: this.config.agentId,
+      episodeId: this.episodeId,
+      board,
+      boardRef,
+      state: stateSummary,
+      candidates: candidates.map(c => ({
+        action: { kind: c.action.kind, type: c.action.kind === "skill" ? `skill:${(c.action as SkillAction).skillName}` : (c.action as PrimitiveAction).type },
+        value: c.value,
+        reasoning: c.reasoning,
+      })),
+      selected: {
+        kind: selected.kind,
+        type: selected.kind === "skill" ? "skill" : (selected as PrimitiveAction).type,
+        description: selected.description,
+        params: selected.kind === "skill" ? { skillName: (selected as SkillAction).skillName, goal: (selected as SkillAction).goal } : selected.params,
+      },
+      result: {
+        success: result.success,
+        output: result.output.substring(0, 2000),
+        error: result.error,
+        durationMs: result.durationMs,
+        artifacts: result.artifacts,
+      },
+      attachments,
+      tags,
+      metrics: {
+        selectedValue,
+        candidateCount: candidates.length,
+        actMs: result.durationMs,
+      },
+    };
+
+    // Write transition
+    const transPath = join(this.replayBufferDir, "transitions", `${paddedId}.json`);
+    writeFileSync(transPath, JSON.stringify(transition, null, 2));
+
+    // Update index
+    this.replayIndex.transitions.push({
+      id,
+      heartbeat: this.heartbeatCount,
+      timestamp: transition.timestamp,
+      actionType: tags.actionType,
+      success: result.success,
+      episode: this.episodeId,
+      tags,
+    });
+
+    this.replayIndex.stats.totalTransitions = this.replayIndex.transitions.length;
+    const successes = this.replayIndex.transitions.filter((t: any) => t.success === true).length;
+    const total = this.replayIndex.transitions.filter((t: any) => t.success !== null).length;
+    this.replayIndex.stats.successRate = total > 0 ? +(successes / total).toFixed(3) : 0;
+
+    this.saveReplayIndex();
+  }
+
+  private finalizeReplayEpisode(): void {
+    if (!this.replayBufferDir || !this.replayIndex) return;
+    const episode = this.replayIndex.episodes.find((e: any) => e.id === this.episodeId);
+    if (episode && !episode.end) {
+      episode.end = this.replayIndex.stats.totalTransitions;
+      episode.status = "completed";
+      this.saveReplayIndex();
+    }
+  }
+
+  private saveReplayIndex(): void {
+    if (!this.replayBufferDir || !this.replayIndex) return;
+    writeFileSync(join(this.replayBufferDir, "index.json"), JSON.stringify(this.replayIndex, null, 2));
+  }
+
+  /**
+   * Render a compact text board from state — used for replay buffer snapshots.
+   * This is a lightweight inline version; the full blackboard skill has more options.
+   */
+  private renderBoardText(state: State): string {
+    const W = 54;
+    const HR = "═".repeat(W);
+    const hr = "─".repeat(W - 2);
+    const pad = (s: string, w = W - 2) => s.length > w ? s.substring(0, w - 1) + "…" : s + " ".repeat(w - s.length);
+    const box = (title: string, lines: string[]) => {
+      const out = [`╠${HR}╣`, `║  ${pad(title)}║`, `║  ┌${hr}┐║`];
+      for (const l of lines) out.push(`║  │${pad(" " + l, W - 4)}│║`);
+      out.push(`║  └${hr}┘║`);
+      return out;
+    };
+
+    const time = new Date(state.timestamp).toISOString().substring(11, 16);
+    const lines: string[] = [];
+    lines.push(`╔${HR}╗`);
+    lines.push(`║  ${pad(`BOARD #${this.heartbeatCount}  [executive]${" ".repeat(20)}${time}`)}║`);
+
+    // Task
+    if (state.currentTask) {
+      const tl = [`Description: ${state.currentTask.description}`];
+      for (const c of state.currentTask.successCriteria ?? []) tl.push(`  ☐ ${c}`);
+      lines.push(...box("TASK", tl));
+    }
+
+    // Last action
+    if (state.lastActionResult) {
+      const r = state.lastActionResult;
+      const type = r.action.kind === "skill" ? `skill:${(r.action as SkillAction).skillName}` : (r.action as PrimitiveAction).type;
+      const al = [`${type} ${r.success ? "✓" : "✗"} (${r.durationMs}ms)`];
+      if (r.output) al.push(r.output.split("\n")[0].substring(0, 70));
+      if (r.error) al.push(`ERROR: ${r.error.substring(0, 60)}`);
+      lines.push(...box("LAST ACTION", al));
+    }
+
+    // Memory
+    const mk = Object.keys(state.memory);
+    if (mk.length) {
+      lines.push(...box(`MEMORY (${mk.length})`, mk.slice(0, 8).map(k => `${k}: ${String(state.memory[k]).substring(0, 50)}`)));
+    }
+
+    // Skills
+    if (state.availableSkills.length) {
+      lines.push(...box(`SKILLS (${state.availableSkills.length})`, [state.availableSkills.map(s => s.name).join("  ")]));
+    }
+
+    lines.push(`╚${HR}╝`);
+    return lines.join("\n");
   }
 
   // ── Skill Discovery ──────────────────────────────────────

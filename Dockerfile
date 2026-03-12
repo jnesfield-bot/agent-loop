@@ -12,8 +12,12 @@ RUN npm ci
 
 COPY tsconfig.json ./
 COPY src/ ./src/
+COPY skills/ ./skills/
+COPY sequences/ ./sequences/
 
-RUN mkdir -p /workspace
+RUN mkdir -p /workspace /buffer
 
-# Run pi interactively with our extension loaded
-ENTRYPOINT ["pi", "-e", "/app/src/extension.ts"]
+ENV REPLAY_BUFFER_DIR=/buffer
+
+# Default: run the demo. Override with docker run ... pi -e /app/src/extension.ts
+CMD ["npx", "tsx", "src/main.ts", "/workspace"]

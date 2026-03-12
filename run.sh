@@ -1,29 +1,21 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -e
 
-if [ -z "$ANTHROPIC_API_KEY" ]; then
-  echo "Error: ANTHROPIC_API_KEY is not set"
-  echo ""
-  echo "Usage:"
-  echo "  ANTHROPIC_API_KEY=sk-ant-... ./run.sh"
-  exit 1
-fi
+IMAGE_NAME="${IMAGE_NAME:-agent-loop}"
 
-echo "Building agent-loop container..."
-docker build -t agent-loop .
+echo "Building $IMAGE_NAME..."
+docker build -t "$IMAGE_NAME" .
 
 echo ""
-echo "Starting pi with agent-loop extension..."
-echo "Commands:"
-echo "  /loop <task>       — Run a task through the heartbeat loop"
-echo "  /loop-status       — Show loop state"
-echo "  /loop-stop         — Stop a running loop"
-echo "  /loop-memory       — Show agent memory"
-echo "  /loop-config       — Configure loop settings"
+echo "Running $IMAGE_NAME..."
+echo "  - Workspace mounted at /workspace"
+echo "  - Replay buffer at /buffer"
 echo ""
 
-docker run -it --rm \
-  -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
-  -v "$(pwd)/workspace:/workspace" \
-  -w /workspace \
-  agent-loop
+# Default: autonomous heartbeat mode
+# Add -- pi -e /app/src/extension.ts for interactive TUI mode
+docker run -it \
+  -e ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY}" \
+  -v "${PWD}/workspace:/workspace" \
+  -v "${PWD}/buffer:/buffer" \
+  "$IMAGE_NAME" "$@"

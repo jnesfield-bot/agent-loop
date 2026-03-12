@@ -48,13 +48,29 @@ import type {
 } from "./types.js";
 
 // ── Primitive Action Types ───────────────────────────────
+//
+// Three categories:
+//   1. Pi tools — file I/O and shell (the "hands")
+//   2. Search tools — structured queries (grep, find, ls)
+//   3. Agent control — memory, delegation, messaging, lifecycle
+//
 
 const PRIMITIVE_TYPES = {
+  // Pi tools (file I/O + shell)
   BASH: "bash",
   READ: "read",
   WRITE: "write",
   EDIT: "edit",
+
+  // Search tools (structured, not shell one-liners)
+  GREP: "grep",
+  FIND: "find",
+  LS: "ls",
+
+  // Agent control
   UPDATE_MEMORY: "update_memory",
+  DELEGATE: "delegate",
+  MESSAGE: "message",
   COMPLETE: "complete",
   WAIT: "wait",
 } as const;
@@ -338,6 +354,37 @@ export class SingleAgent extends AgentLoop {
         case PRIMITIVE_TYPES.EDIT:
           await this.executeEdit(action.params.path as string, action.params.oldText as string, action.params.newText as string);
           output = `Edited ${action.params.path}`;
+          break;
+
+        // Search tools
+        case PRIMITIVE_TYPES.GREP:
+          output = await this.executeGrep(
+            action.params.pattern as string,
+            action.params.path as string | undefined,
+            action.params.options as Record<string, unknown> | undefined,
+          );
+          break;
+        case PRIMITIVE_TYPES.FIND:
+          output = await this.executeFind(
+            action.params.path as string | undefined,
+            action.params.pattern as string | undefined,
+            action.params.type as string | undefined,
+            action.params.maxDepth as number | undefined,
+          );
+          break;
+        case PRIMITIVE_TYPES.LS:
+          output = await this.executeLs(
+            action.params.path as string | undefined,
+            action.params.options as Record<string, unknown> | undefined,
+          );
+          break;
+
+        // Agent control
+        case PRIMITIVE_TYPES.DELEGATE:
+          output = await this.executeDelegate(action.params);
+          break;
+        case PRIMITIVE_TYPES.MESSAGE:
+          output = await this.executeMessage(action.params);
           break;
         case PRIMITIVE_TYPES.UPDATE_MEMORY:
           this.memory[action.params.key as string] = action.params.value as string;
@@ -665,6 +712,107 @@ Respond with ONLY "continue" or "abort".`;
     await writeFile(fullPath, content.replace(oldText, newText));
   }
 
+  // ── Search Tools ───────────────────────────────────────────
+
+  private async executeGrep(
+    pattern: string,
+    path?: string,
+    options?: Record<string, unknown>,
+  ): Promise<string> {
+    const target = path
+      ? (path.startsWith("/") ? path : join(this.config.workDir, path))
+      : this.config.workDir;
+    const flags: string[] = ["-rn"];
+    if (options?.ignoreCase) flags.push("-i");
+    if (options?.maxCount) flags.push(`-m ${options.maxCount}`);
+    if (options?.include) flags.push(`--include="${options.include}"`);
+    if (options?.exclude) flags.push(`--exclude="${options.exclude}"`);
+    if (options?.context) flags.push(`-C ${options.context}`);
+    const cmd = `grep ${flags.join(" ")} "${pattern.replace(/"/g, '\\"')}" ${target}`;
+    return this.executeBash(cmd);
+  }
+
+  private async executeFind(
+    path?: string,
+    pattern?: string,
+    type?: string,
+    maxDepth?: number,
+  ): Promise<string> {
+    const target = path
+      ? (path.startsWith("/") ? path : join(this.config.workDir, path))
+      : this.config.workDir;
+    const parts = ["find", target];
+    if (maxDepth != null) parts.push(`-maxdepth ${maxDepth}`);
+    if (type) parts.push(`-type ${type}`);
+    if (pattern) parts.push(`-name "${pattern.replace(/"/g, '\\"')}"`);
+    parts.push("| head -100");
+    return this.executeBash(parts.join(" "));
+  }
+
+  private async executeLs(
+    path?: string,
+    options?: Record<string, unknown>,
+  ): Promise<string> {
+    const target = path
+      ? (path.startsWith("/") ? path : join(this.config.workDir, path))
+      : this.config.workDir;
+    const flags: string[] = ["-la"];
+    if (options?.recursive) flags.push("-R");
+    if (options?.humanReadable) flags.push("-h");
+    return this.executeBash(`ls ${flags.join(" ")} ${target}`);
+  }
+
+  // ── Agent Control ─────────────────────────────────────────
+
+  /**
+   * Delegate a task to a child agent.
+   * In SingleAgent this is a stub — real delegation happens in ExecutiveAgent.
+   * Here we log the intent so the pattern is established.
+   */
+  private async executeDelegate(params: Record<string, unknown>): Promise<string> {
+    const taskDescription = params.description as string ?? "(no description)";
+    const targetAgent = params.targetAgent as string ?? "worker";
+    const priority = params.priority as number ?? 5;
+
+    // Store delegation intent in memory for future ExecutiveAgent implementation
+    const delegations = JSON.parse(this.memory["_delegations"] ?? "[]");
+    delegations.push({
+      targetAgent,
+      description: taskDescription,
+      priority,
+      timestamp: Date.now(),
+      status: "pending",
+    });
+    this.memory["_delegations"] = JSON.stringify(delegations);
+    await this.saveMemory();
+
+    return `Delegation queued: [${targetAgent}] ${taskDescription} (priority: ${priority}). ` +
+      `Note: SingleAgent cannot spawn children — delegation will be fulfilled by ExecutiveAgent.`;
+  }
+
+  /**
+   * Send a message to another agent (parent, child, or sibling).
+   * In SingleAgent this writes to a message queue file.
+   */
+  private async executeMessage(params: Record<string, unknown>): Promise<string> {
+    const to = params.to as string ?? "parent";
+    const content = params.content as string ?? "";
+    const channel = params.channel as string ?? "default";
+
+    const messages = JSON.parse(this.memory["_outbox"] ?? "[]");
+    messages.push({
+      to,
+      channel,
+      content,
+      from: this.config.agentId,
+      timestamp: Date.now(),
+    });
+    this.memory["_outbox"] = JSON.stringify(messages);
+    await this.saveMemory();
+
+    return `Message sent to ${to} on channel ${channel}: "${content.substring(0, 100)}"`;
+  }
+
   // ── Memory Persistence ───────────────────────────────────
 
   private async loadMemory(): Promise<void> {
@@ -712,11 +860,21 @@ You MUST respond with ONLY a JSON array. No other text. Each element:
 
 ## Primitive Action Types
 
+### File I/O (pi tools)
 - **bash**: \`{ "command": "..." }\` — Run a shell command
 - **read**: \`{ "path": "..." }\` — Read a file
 - **write**: \`{ "path": "...", "content": "..." }\` — Write/create a file
 - **edit**: \`{ "path": "...", "oldText": "...", "newText": "..." }\` — Edit a file
-- **update_memory**: \`{ "key": "...", "value": "..." }\` — Persist something to memory
+
+### Search (structured queries — prefer these over shell one-liners)
+- **grep**: \`{ "pattern": "...", "path": "...", "options": { "ignoreCase": true, "include": "*.ts", "context": 3 } }\` — Search file contents
+- **find**: \`{ "path": "...", "pattern": "*.ts", "type": "f", "maxDepth": 3 }\` — Find files
+- **ls**: \`{ "path": "...", "options": { "recursive": true } }\` — List directory
+
+### Agent Control
+- **update_memory**: \`{ "key": "...", "value": "..." }\` — Persist to working memory
+- **delegate**: \`{ "description": "...", "targetAgent": "worker", "priority": 5 }\` — Assign task to child
+- **message**: \`{ "to": "parent|child-id", "content": "...", "channel": "default" }\` — Send inter-agent message
 - **complete**: \`{ "summary": "..." }\` — Mark task as done
 - **wait**: \`{}\` — Do nothing this heartbeat
 

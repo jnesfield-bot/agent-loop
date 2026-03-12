@@ -2,85 +2,210 @@
 
 An RL-inspired autonomous agent framework built on the [pi coding agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) SDK. Instead of free-running LLM conversations, the agent operates in a deterministic **heartbeat loop**: Observe → Evaluate → Select → Act → Repeat.
 
+> Also available at [github.com/jnesfield-bot/rho](https://github.com/jnesfield-bot/rho) — ρ, because it comes after π.
+
 ## Motivation
 
 Most LLM agent frameworks let the model free-run — it thinks, calls tools, thinks again, calls more tools — until it decides it's done. This works, but it's a black box. You can't inspect the decision boundary, you can't swap the policy, and you can't audit why it chose action A over action B.
 
 This project imposes structure. Every heartbeat, the agent:
 
-1. **Observes** the current state of the world
+1. **Observes** the current state of the world (via the **blackboard**)
 2. **Evaluates** candidate actions by asking the LLM to score them
 3. **Selects** the best action via a deterministic policy function
-4. **Acts** by executing that single action
+4. **Acts** by executing that single action (primitive or skill sequence)
 
 The key insight is the **separation between evaluation and selection**. The LLM proposes and scores. A policy function — which you control — decides. This gives you a seam for determinism, safety constraints, logging, and eventually learning.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│                HEARTBEAT LOOP                │
-│                                              │
-│  ┌──────────┐    ┌──────────┐    ┌────────┐ │
-│  │ OBSERVE  │───>│ EVALUATE │───>│ SELECT │ │
-│  │  state   │    │  actions │    │ policy │ │
-│  └──────────┘    └──────────┘    └───┬────┘ │
-│       ▲                              │      │
-│       │          ┌──────────┐        │      │
-│       └──────────│   ACT    │<───────┘      │
-│                  └──────────┘               │
-└─────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│                   HEARTBEAT LOOP                      │
+│                                                      │
+│  ┌───────────┐    ┌──────────┐    ┌────────┐        │
+│  │  OBSERVE  │───>│ EVALUATE │───>│ SELECT │        │
+│  │ blackboard│    │  scored  │    │ greedy │        │
+│  │   + lens  │    │  actions │    │ policy │        │
+│  └───────────┘    └──────────┘    └───┬────┘        │
+│       ▲                               │             │
+│       │          ┌──────────────┐     │             │
+│       └──────────│     ACT      │<────┘             │
+│                  │ primitive OR │                    │
+│                  │ skill seq.   │                    │
+│                  └──────────────┘                    │
+└──────────────────────────────────────────────────────┘
 ```
 
-### Phase 1 (Current): Single Agent
+## The Blackboard (Observation)
 
-A single `AgentLoop` base class with a concrete `SingleAgent` implementation that wires into pi's SDK for LLM inference and tool execution.
+The agent's primary observation surface, inspired by [Glyph](https://arxiv.org/abs/2510.17800) (arXiv:2510.17800). Every heartbeat, the observation step runs as a deterministic skill sequence:
 
-### Phase 2 (Planned): Hierarchical Executive + Workers
+1. **Gather** raw state (task, memory, workspace, last result, children, inputs)
+2. **Render** the state through the agent's **lens** into the board layout
+3. **Read** the rendered board (always first)
+4. **Supplement** with scratchpads and memory stores
 
-Inspired by [Learning by Cheating](#references), the base loop becomes the parent class for two specializations:
+### Segmentation
 
+The board is divided into **segments** with visibility tags. Agents carry a **lens** — a set of tags that determines which segments they see. Same state, different views.
+
+| Segment        | Tags                    | Contains                          |
+|----------------|-------------------------|-----------------------------------|
+| `header`       | _(all)_                 | Heartbeat #, time, lens name      |
+| `task`         | `task`                  | Description, criteria, progress   |
+| `action`       | `action`                | Last action, status, output       |
+| `memory`       | `memory`                | Working memory key-values         |
+| `workspace`    | `workspace`             | File listing, recent changes      |
+| `inputs`       | `inputs`                | Pending messages/events           |
+| `children`     | `children`              | Child agent statuses              |
+| `skills`       | `skills`                | Available skill names             |
+| `active_skill` | `skills`, `action`      | Currently executing skill         |
+
+**Lens presets:**
+
+| Lens        | Sees                                              | For              |
+|-------------|---------------------------------------------------|------------------|
+| `executive` | Everything                                         | Top-level agent  |
+| `worker`    | task, action, memory, workspace, skills            | Focused executor |
+| `monitor`   | task, children, inputs, meta                       | Oversight role   |
+| `minimal`   | task, action only                                  | Constrained sub-agent |
+
+**Why segments?** Least privilege (workers don't see siblings), token efficiency (smaller board = faster inference), and composability (add segments without changing lenses).
+
+## Actions: Primitives and Skills
+
+Actions come in two forms — the **Options framework** from Sutton, Precup & Singh (1999):
+
+### Primitive Actions (one step, one heartbeat)
+
+Three categories of primitives:
+
+**File I/O (pi tools):**
+
+| Action  | Params                          | Description            |
+|---------|---------------------------------|------------------------|
+| `bash`  | `command`                       | Execute shell command  |
+| `read`  | `path`                          | Read a file            |
+| `write` | `path`, `content`               | Write/create a file    |
+| `edit`  | `path`, `oldText`, `newText`    | Surgical file edit     |
+
+**Search (structured queries):**
+
+| Action  | Params                                    | Description            |
+|---------|-------------------------------------------|------------------------|
+| `grep`  | `pattern`, `path`, `options`              | Search file contents   |
+| `find`  | `path`, `pattern`, `type`, `maxDepth`     | Find files by pattern  |
+| `ls`    | `path`, `options`                         | List directory         |
+
+**Agent Control:**
+
+| Action          | Params                                    | Description                |
+|-----------------|-------------------------------------------|----------------------------|
+| `update_memory` | `key`, `value`                            | Persist to working memory  |
+| `delegate`      | `description`, `targetAgent`, `priority`  | Assign task to child agent |
+| `message`       | `to`, `content`, `channel`                | Inter-agent communication  |
+| `complete`      | `summary`                                 | Mark task done, stop loop  |
+| `wait`          | —                                         | Do nothing this heartbeat  |
+
+### Skill Actions (multi-step sequences, one heartbeat)
+
+Skills are coherent multi-step workflows that execute within a single heartbeat. The agent selects a skill by name and goal, the LLM plans the concrete steps, then each step executes sequentially with per-step events for observability.
+
+```json
+{
+  "kind": "skill",
+  "type": "skill",
+  "skillName": "arxiv-research",
+  "goal": "Find and extract the DQN algorithm from arXiv:1312.5602",
+  "description": "Use the research skill to get the algorithm",
+  "params": {}
+}
 ```
-┌─────────────────────────────────────────────────────┐
-│            EXECUTIVE AGENT (Privileged)              │
-│                                                     │
-│  Full state visibility, plan/goal graph,            │
-│  resource constraints, all child statuses            │
-│                                                     │
-│  Action space: spawn_worker, steer_worker,          │
-│  abort_worker, merge_results, update_plan, wait     │
-│                                                     │
-│  ┌──────────────┐  ┌──────────────┐                 │
-│  │   WORKER 1   │  │   WORKER N   │                 │
-│  │              │  │              │                 │
-│  │ Scoped task  │  │ Scoped task  │                 │
-│  │ brief only   │  │ brief only   │                 │
-│  │              │  │              │                 │
-│  │ Action space:│  │ Action space:│                 │
-│  │ bash, read,  │  │ bash, read,  │                 │
-│  │ write, edit  │  │ write, edit  │                 │
-│  └──────────────┘  └──────────────┘                 │
-└─────────────────────────────────────────────────────┘
+
+## Skills
+
+Skills are self-contained capability packages with SKILL.md documentation and executable scripts. The agent discovers them on startup and can invoke them as actions.
+
+### arxiv-research
+
+Search arXiv, download LaTeX source, extract algorithms and pseudocode.
+
+| Script                 | Purpose                              |
+|------------------------|--------------------------------------|
+| `search.mjs`           | Query arXiv API with field prefixes  |
+| `metadata.mjs`         | Get full paper metadata by ID        |
+| `download-source.mjs`  | Download and extract LaTeX source    |
+| `extract-algorithms.mjs` | Parse algorithm/pseudocode blocks  |
+
+### skill-sequencer
+
+Compile skills into deterministic, replayable step sequences.
+
+| Script        | Purpose                                          |
+|---------------|--------------------------------------------------|
+| `compile.mjs` | SKILL.md + goal → JSON sequence file             |
+| `run.mjs`     | Execute sequences with variable substitution     |
+| `list.mjs`    | List compiled sequences                          |
+
+**Features:** `{{variable}}` templates, `captureAs` for chaining step outputs, `onFailure` policies (abort/continue/retry:N), conditional steps, `--dry-run`, step ranges.
+
+```bash
+# Compile
+node skills/skill-sequencer/scripts/compile.mjs skills/arxiv-research \
+  "Find and implement DQN from arXiv:1312.5602" sequences/dqn.json
+
+# Run
+node skills/skill-sequencer/scripts/run.mjs sequences/dqn.json
+
+# Run with variables
+node skills/skill-sequencer/scripts/run.mjs sequences/template.json --var paper_id=1706.03762
 ```
 
-The **executive** is the privileged agent — it "cheats" by having access to the full picture (all memory, all child statuses, the complete plan graph). Workers operate with scoped task briefs and limited context. Each side solves an easier problem.
+### blackboard
 
-The executive doesn't need to know *how* to do the work in detail. Workers don't need to understand the full picture. Over time, worker execution traces accumulate and patterns can be distilled — workers get smarter, the executive can delegate more abstractly.
+Visual observation board with segmented rendering and lens-based visibility.
 
-### Phase 3 (Planned): Distillation & Learning
+| Script                | Purpose                              |
+|-----------------------|--------------------------------------|
+| `render.mjs`          | Render state → board (text/md/json)  |
+| `read-scratchpad.mjs` | Read working notes                   |
+| `read-memory.mjs`     | Read persistent key-value store      |
 
-Log every executive→worker interaction. Build feedback loops. Swap in smaller/cheaper models for well-understood worker tasks. The "Learning by Cheating" payoff.
+```bash
+# Executive view
+node skills/blackboard/scripts/render.mjs --state state.json --lens executive
+
+# Worker view (smaller, focused)
+node skills/blackboard/scripts/render.mjs --state state.json --lens worker
+
+# JSON for programmatic use
+node skills/blackboard/scripts/render.mjs --state state.json --format json --lens minimal
+```
 
 ## Project Structure
 
 ```
 src/
-├── types.ts          Core type definitions (State, Action, ScoredAction,
-│                     TaskBrief, ChildStatus, LoopEvent, etc.)
+├── types.ts          Core types (State, Action, SkillAction, SkillDescriptor,
+│                     SkillExecution, TaskBrief, ChildStatus, LoopEvent, ...)
 ├── agent-loop.ts     Abstract base class — the heartbeat loop
-├── single-agent.ts   Concrete implementation wired to pi's SDK
+├── single-agent.ts   Concrete implementation wired to pi SDK
 ├── main.ts           Demo runner with formatted heartbeat logging
 └── index.ts          Public API exports
+
+skills/
+├── arxiv-research/   Search arXiv, download LaTeX, extract algorithms
+│   ├── SKILL.md
+│   └── scripts/      search, metadata, download-source, extract-algorithms
+├── skill-sequencer/  Compile skills into deterministic sequences
+│   ├── SKILL.md
+│   └── scripts/      compile, run, list
+└── blackboard/       Visual observation board with segmented rendering
+    ├── SKILL.md
+    └── scripts/      render, read-scratchpad, read-memory
+
+sequences/            Compiled skill sequences (JSON)
 ```
 
 ### `AgentLoop` (Base Class)
@@ -96,109 +221,76 @@ abstract class AgentLoop {
 }
 ```
 
-Lifecycle hooks for setup/teardown, a `shouldBeat()` gate, error handling, and an event system for full observability. Supports both single-tick execution (`tick()`) and continuous running (`run()`) with configurable heartbeat intervals and max-heartbeat limits.
-
 ### `SingleAgent`
 
 The Phase 1 concrete implementation:
 
-- **Observe**: Reads workspace files, persistent memory, and pending inputs
-- **Evaluate**: Sends structured state to the LLM, receives scored action candidates as JSON
-- **Select**: Greedy policy — picks the highest-valued action. Deliberately simple and deterministic. Future: epsilon-greedy, UCB, constraint-based filtering
-- **Act**: Dispatches to bash, read, write, edit, memory update, complete, or wait
+- **Observe**: Reads workspace, memory, inputs; discovers available skills
+- **Evaluate**: Sends state + available skills to LLM, receives scored candidates (primitive or skill) as JSON
+- **Select**: Greedy policy — picks highest-valued action. Deterministic. Future: epsilon-greedy, UCB, constraints
+- **Act**: Dispatches primitives (bash/read/write/edit/grep/find/ls/memory/delegate/message/complete/wait) or executes skill sequences (plan steps via LLM → execute sequentially → aggregate result)
 
-Uses pi's SDK for LLM inference and tool execution. Memory persists to disk. Full action history is logged per run.
+## Hierarchical Architecture (Planned)
 
-### Action Space
+### Phase 2: Executive + Workers
 
-| Action | Params | Description |
-|--------|--------|-------------|
-| `bash` | `command` | Execute a shell command |
-| `read` | `path` | Read a file |
-| `write` | `path`, `content` | Write/create a file |
-| `edit` | `path`, `oldText`, `newText` | Surgical file edit |
-| `update_memory` | `key`, `value` | Persist to working memory |
-| `complete` | `summary` | Mark task done, stop loop |
-| `wait` | — | Do nothing this heartbeat |
+```
+┌─────────────────────────────────────────────────────┐
+│            EXECUTIVE AGENT [executive lens]          │
+│                                                     │
+│  Full board visibility, plan graph, all children    │
+│  Actions: delegate, steer, abort, merge, plan       │
+│                                                     │
+│  ┌──────────────┐  ┌──────────────┐                 │
+│  │   WORKER 1   │  │   WORKER N   │                 │
+│  │ [worker lens]│  │ [worker lens]│                 │
+│  │              │  │              │                 │
+│  │ Scoped task  │  │ Scoped task  │                 │
+│  │ + workspace  │  │ + workspace  │                 │
+│  └──────────────┘  └──────────────┘                 │
+└─────────────────────────────────────────────────────┘
+```
+
+The executive is privileged (sees everything via `executive` lens). Workers see only their task via `worker` lens. The blackboard segmentation makes this trivial — same state, different lenses.
+
+### Phase 3: Distillation & Learning
+
+Log executive→worker interactions. Build feedback loops. Swap cheaper models for well-understood worker tasks.
 
 ## Quick Start
 
 ```bash
-# Clone
 git clone https://github.com/jnesfield-bot/agent-loop.git
 cd agent-loop
-
-# Install
 npm install
-
-# Run the demo
 ANTHROPIC_API_KEY=sk-ant-... npx tsx src/main.ts [work-directory]
 ```
 
-The demo creates an agent tasked with exploring its environment and writing a report. You'll see each heartbeat's Observe → Evaluate → Select → Act cycle logged with timing and scoring.
+## References
 
-## Dependencies
-
-- **[@mariozechner/pi-coding-agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent)** — The pi SDK for LLM sessions, tool execution, session management, and extensions
-- **[@mariozechner/pi-agent-core](https://github.com/badlogic/pi-mono)** — Core agent primitives (Agent, messages, types)
-- **[@mariozechner/pi-ai](https://github.com/badlogic/pi-mono)** — Model registry and LLM provider abstraction
-
-## References & Influences
-
-### Learning by Cheating
-
-> Chen, D., Zhou, B., Koltun, V., & Krähenbühl, P. (2019). *Learning by Cheating*. CoRL 2020.
-> [arXiv:1912.12294](https://arxiv.org/abs/1912.12294)
-
-The core idea: decompose a hard problem (raw input → actions) into two easier problems by introducing a **privileged agent** that has access to ground truth state. The privileged agent learns an optimal policy trivially. A sensorimotor agent then learns to imitate it. Applied here: the executive agent is privileged (full state, all context), workers are sensorimotor (scoped briefs, local context). Each solves an easier problem. The executive's rich task briefs are the imitation signal.
-
-### Pi Coding Agent & Mom (Master of Mischief)
-
-- **[pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent)** — A minimal terminal coding harness by Mario Zechner. Extensible via skills, extensions, prompt templates, and themes. Provides the SDK this project builds on.
-- **[Mom](https://github.com/badlogic/pi-mono/tree/main/packages/mom)** — A self-managing Slack bot built on pi. Installs its own tools, writes its own scripts, maintains workspace memory. Demonstrates the pattern of an autonomous agent with persistent state and skill creation. Mom's architecture — particularly its memory system, skills model, and sandbox execution — directly informed the design here.
-- **[OpenClaw](https://github.com/openclaw/openclaw)** — A real-world pi SDK integration that demonstrated the programmatic embedding pattern we follow.
-
-### Browser_use
-
-[Browser_use](https://github.com/browser-use/browser-use) runs a dual-loop architecture: a planner that decomposes page interactions into steps, and an executor that drives the browser. The planner has privileged access to goals and DOM structure; the executor has the concrete action space (click, type, scroll). Same separation of concerns applied here between executive and worker.
-
-### Figure AI
-
-[Figure](https://www.figure.ai/) uses hierarchical control in their humanoid robots: high-level task planners that understand goals and context, paired with low-level motor controllers that execute physical actions. The planner doesn't need to know joint torques; the motor controller doesn't need to know why it's picking up a cup. This strategic/tactical split is the same pattern at a different scale.
-
-### Reinforcement Learning Foundations
-
-The heartbeat loop directly mirrors the standard RL agent-environment interaction:
-
-1. Agent observes state *s_t*
-2. Agent selects action *a_t* = π(*s_t*) according to policy
-3. Environment returns reward *r_t* and next state *s_{t+1}*
-4. Repeat
-
-We replace the reward signal with LLM-generated action values (the evaluate phase) and use a greedy policy for selection. The architecture is designed so that as execution traces accumulate, more sophisticated policies can be plugged in — epsilon-greedy for exploration, constraint-based filtering for safety, or learned value functions for efficiency.
-
-> Sutton, R. S., & Barto, A. G. (2018). *Reinforcement Learning: An Introduction* (2nd ed.). MIT Press.
-> [incompleteideas.net/book/the-book-2nd.html](http://incompleteideas.net/book/the-book-2nd.html)
+- **Learning by Cheating** — Chen et al. (2019). [arXiv:1912.12294](https://arxiv.org/abs/1912.12294). Privileged agent → sensorimotor imitation. Our executive/worker split.
+- **Glyph** — Cheng et al. (2025). [arXiv:2510.17800](https://arxiv.org/abs/2510.17800). Visual-text compression for dense context. Our blackboard rendering principle.
+- **Options Framework** — Sutton, Precup & Singh (1999). Temporally extended actions. Our primitive/skill action model.
+- **Pi & Mom** — [github.com/badlogic/pi-mono](https://github.com/badlogic/pi-mono). The SDK we build on. Mom's autonomous agent patterns informed the design.
+- **Sutton & Barto** — *Reinforcement Learning: An Introduction* (2018). The observe→select→act loop.
 
 ## Design Notes
 
-**Why not just let the LLM free-run?** Free-running works well for interactive coding sessions. But for autonomous agents operating on business tasks — especially ones that spawn sub-agents — you need a decision boundary you can inspect, log, constrain, and override. The evaluate/select split gives you that.
+**Why not just let the LLM free-run?** For autonomous agents on business tasks — especially with sub-agents — you need a decision boundary you can inspect, log, constrain, and override. The evaluate/select split gives you that.
 
-**Why greedy policy?** Start simple. The greedy policy is fully deterministic and easy to reason about. It's the right default before you have enough trace data to justify something more sophisticated. The `select()` method is a single function override away from any policy you want.
+**Why greedy policy?** Start simple. Fully deterministic, easy to reason about. The `select()` method is one override away from any policy.
 
-**Why one action per heartbeat?** Atomicity. Each heartbeat is one observable state transition. You can replay the full history, you can intervene between any two actions, and you can attribute outcomes to specific decisions. Batching multiple actions per heartbeat is a future optimization once the single-action loop is proven.
+**Why one action per heartbeat?** Atomicity. Each heartbeat is one observable state transition. Replay the full history, intervene between any two actions, attribute outcomes to specific decisions.
 
-**Why not use pi's tools directly in the evaluate phase?** The evaluate phase is pure reasoning — "what should I do next?" The act phase is impure execution — "do it." Keeping them separate means the LLM's tool use in evaluate is constrained to proposing, not executing. This prevents runaway tool chains in the evaluation step.
+**Why skills as sequences, not free-form?** A skill is a recipe, not a conversation. Compile it to a deterministic sequence, review it, edit it, replay it. The LLM plans once; execution is mechanical.
 
-**On the executive/worker hierarchy:** Both inherit from the same `AgentLoop` base class. A worker could theoretically spawn its own sub-workers (depth-limited). The executive is itself a worker from the perspective of a higher-level system. This gives you fractal composability — the same pattern at every scale.
+**Why the blackboard?** The agent needs a consistent, structured view of its world. Not a blob of text — a fixed-layout board where it knows where to look. Dense over verbose. Symbols over sentences. Glyph's principle: maximize information per token.
 
 ## Status
 
-**Phase 1** — ✅ Complete. Single agent heartbeat loop, compiles and runs against pi SDK.
-
-**Phase 2** — 🔜 Next. Executive + Worker specializations, task delegation, structured status reporting.
-
-**Phase 3** — 📋 Planned. Trace logging, distillation, learned policies.
+- ✅ **Phase 1** — Single agent heartbeat loop with primitives + skills + blackboard
+- 🔜 **Phase 2** — Executive + Worker with lens-based observation, delegation
+- 📋 **Phase 3** — Trace logging, distillation, learned policies
 
 ## License
 
